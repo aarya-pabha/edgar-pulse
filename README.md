@@ -1,8 +1,13 @@
 # 🏛️ Wall St. AI Analyst: Hybrid RAG & Live Market Data Agent
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![LlamaIndex](https://img.shields.io/badge/LlamaIndex-0.10+-black.svg)](https://www.llamaindex.ai/)
-[![OpenAI](https://img.shields.io/badge/OpenAI-gpt--4o--mini-green.svg)](https://openai.com/)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10+-0f172a?style=flat-square&logo=python&logoColor=3776AB)](https://www.python.org/)
+[![LlamaIndex](https://img.shields.io/badge/LlamaIndex-0.10+-0f172a?style=flat-square&logo=llamaindex&logoColor=white)](https://www.llamaindex.ai/)
+[![Pinecone](https://img.shields.io/badge/Pinecone-Vector_DB-0f172a?style=flat-square&logo=pinecone&logoColor=000000)](https://www.pinecone.io/)
+[![OpenAI](https://img.shields.io/badge/OpenAI-GPT--4o_Mini-0f172a?style=flat-square&logo=openai&logoColor=white)](https://openai.com/)
+[![Ragas Evaluation](https://img.shields.io/badge/Ragas_Faithfulness-83.5%25-0f172a?style=flat-square&logo=target&logoColor=white)](https://github.com/explodinggradients/ragas)
+[![Streamlit](https://img.shields.io/badge/Streamlit-App-0f172a?style=flat-square&logo=streamlit&logoColor=FF4B4B)](https://streamlit.io/)
+[![Hugging Face](https://img.shields.io/badge/Hugging_Face-Live_Space-0f172a?style=flat-square&logo=huggingface&logoColor=FFD21E)](https://huggingface.co/spaces/Aarya003/Financial-Analyst-Agent)
+[![License: MIT](https://img.shields.io/badge/License-MIT-0f172a?style=flat-square&logo=open-source-initiative&logoColor=white)](LICENSE)
 
 ## 🚀 Live Interactive Demo
 **Interact with the deployed agent here:** [Wall St. AI Analyst on Hugging Face Spaces](https://huggingface.co/spaces/Aarya003/Financial-Analyst-Agent)
