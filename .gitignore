@@ -2,6 +2,7 @@
 .env
 .streamlit/secrets.toml
 
+.archify/
 # Python Caches
 __pycache__/
 *.pyc

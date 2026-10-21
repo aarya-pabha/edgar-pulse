@@ -12,6 +12,8 @@
 ## 🚀 Live Interactive Demo
 **Interact with the deployed agent here:** [Wall St. AI Analyst on Hugging Face Spaces](https://huggingface.co/spaces/Aarya003/Financial-Analyst-Agent)
 
+> **Note on Cold Starts:** Free-tier Hugging Face Spaces spin down into a sleep state after a period of inactivity. If the app is sleeping, waking the container takes approximately 30–60 seconds on first launch.
+
 ## 📌 Project Overview
 Standard Retrieval-Augmented Generation (RAG) applications fail in the financial sector because they attempt to extract highly volatile, real-time numbers (like stock prices or PE ratios) from static, outdated PDF documents. 
 
@@ -21,86 +23,95 @@ The **Wall St. AI Analyst** solves this by implementing a **Semantic Routing Arc
 ```text
 financial-ai-agent/
 │
-├── app.py                                 # The final Streamlit application & routing logic
+├── app.py                                 # Streamlit UI & agent routing application
+├── rag_guardrails.py                      # Headless guardrails, symbol lookup, & safe metrics
 ├── nasdaq-listed.csv                      # Universe of supported tickers for Market Data
-├── requirements.txt                       # Explicit dependencies for deployment
+├── requirements.txt                       # Production deployment dependencies
+├── requirements-dev.txt                   # Developer and testing dependencies (pytest)
 │
 ├── evaluation/                            
 │   ├── phase3_validation_set.csv          # Synthetic evaluation questions & contexts
-│   └── phase3_ragas_scores_adjusted.csv   # Final Ragas scores correcting for honest refusals
+│   └── phase3_ragas_scores_adjusted.csv   # Audited Ragas scores reflecting honest refusals
 │
 ├── notebooks/                             
-│   └── Financial_RAG.ipynb # Complete logic, architecture, and Ragas evaluation flow
+│   └── Financial_RAG.ipynb                # Ingestion, architecture, & Ragas evaluation flow
+│
+├── tests/                                 # Unit & regression test suite (100% headless)
+│   ├── test_rag_guardrails.py             # Quota, regex, and error-isolation tests
+│   └── test_evaluation_baseline.py        # Benchmark score integrity tests
 │
 └── README.md                              # Project documentation
 ```
 
-🏗️ System Architecture & Engineering Decisions
------------------------------------------------
+## 🏗️ System Architecture & Engineering Decisions
 
-This agent was built with a decoupled architecture prioritizing strict boundary enforcement to completely eliminate LLM hallucinations.
+This agent was built with a decoupled architecture prioritizing strict boundary enforcement to eliminate LLM hallucinations.
 
-### 1\. The Ingestion Pipeline (Handling Massive Financial Tables)
+### 1. The Ingestion Pipeline (Handling Massive Financial Tables)
 
 Financial SEC 10-K reports contain "Consolidated Financial Statements"—massive grids of data. Standard character-based text splitters destroy these tables by cutting them in half, causing the LLM to lose column headers and hallucinate numbers.
 
-*   **Solution:** I utilized LlamaIndex's MarkdownElementNodeParser. This structural parser treats Markdown tables as atomic elements, refusing to split them.
-    
-*   **Trade-off & Fix:** This resulted in massive context chunks (up to 3,000 tokens per table). To ensure the LLM found the exact data without overflowing context windows, I engineered the retrieval engine to fetch an expanded window (similarity\_top\_k=8) coupled with strict Metadata Filtering (e.g., ticker='AAPL') to prevent cross-company data contamination.
-    
+* **Solution:** Utilizes LlamaIndex's `MarkdownElementNodeParser`. This structural parser treats Markdown tables as atomic elements, refusing to split them.
+* **Trade-off & Fix:** This resulted in massive context chunks (up to 3,000 tokens per table). To ensure the LLM found the exact data without overflowing context windows, the retrieval engine fetches an expanded window (`similarity_top_k=8`) coupled with strict Metadata Filtering (e.g., `ticker='AAPL'`) to prevent cross-company data contamination.
 
-### 2\. The Pydantic Semantic Router
+### 2. The Pydantic Semantic Router
 
-The core decision engine is powered by an OpenAIPydanticProgram. Instead of letting the LLM guess how to answer, the router enforces strict tool selection:
+The core decision engine is powered by an `OpenAIPydanticProgram`. Instead of letting the LLM guess how to answer, the router enforces strict tool selection:
 
-*   **Tool 1 (financial\_rag):** Triggered for internal company details, historical revenue, risks, and strategy. Queries Pinecone.
-    
-*   **Tool 2 (market\_data):** Triggered ONLY for real-time trading metrics (Price, Market Cap, Volume). Queries the yfinance API for all NASDAQ-listed companies.
-    
-*   **Hybrid Mode:** If a user asks _"Compare Tesla's current price to its supply chain risks"_, the router triggers _both_ tools in parallel and synthesizes the final answer.
-    
+* **Tool 1 (`financial_rag`):** Triggered for internal company details, historical revenue, risks, and strategy. Queries Pinecone vector index.
+* **Tool 2 (`market_data`):** Triggered for real-time trading metrics (Price, Market Cap, Volume). Queries `yfinance.fast_info` (<150ms latency) with graceful fallback.
+* **Hybrid Mode:** If a user asks *"Compare Tesla's current price to its supply chain risks"*, the router triggers both tools and synthesizes the final comparative answer.
+* **Cost & Abuse Guard:** Protected against OWASP LLM10 unbounded consumption with per-query length limits (1,000 chars) and per-session quotas (25 queries).
 
-📊 Rigorous Evaluation Pipeline (Ragas)
----------------------------------------
+## 📊 Rigorous Evaluation Pipeline (Ragas)
 
-An AI agent is only as good as its validation. I evaluated this system against a custom synthetic benchmark of 20 high-complexity financial questions using the **Ragas** framework, utilizing gpt-4o as the judge.
+An AI agent is only as good as its validation. The system was evaluated against a custom synthetic benchmark of 20 high-complexity financial questions using the **Ragas** framework, utilizing `gpt-4o` as the judge.
 
 ### Overcoming the "Honest Refusal" Penalty
 
-To prevent hallucinations (the "Nvidia Trap"), the agent was strictly prompted: _"If the data is missing, simply output: 'Data not available in the context.'"_ While the agent successfully followed this rule, standard Ragas algorithms penalized these honest refusals with a 0.0 Answer Relevancy score because the evaluator LLM could not reverse-engineer the original question from a refusal.
+To prevent hallucinations, the agent was strictly prompted: *"If the data is missing, simply output: 'Data not available in the context.'"* While the agent successfully followed this rule, standard Ragas algorithms penalized these honest refusals with a 0.0 Answer Relevancy score because the evaluator LLM could not reverse-engineer the original question from a refusal.
 
-I engineered a custom Python evaluation script (available in the notebooks/ directory) to algorithmically adjust for these correct programmatic refusals, revealing the system's true, production-grade metrics:
+Our audited evaluation pipeline adjusts for these programmatic refusals while preserving genuine scores on partial answers:
 
-*   **Faithfulness:** 0.8349 (83.5% of generated claims are perfectly backed by the retrieved 10-K context).
-    
-*   **Answer Relevancy:** 0.9177 (91.8% direct alignment with user intent, without conversational filler).
-    
+* **Faithfulness: 0.8349 (83.5%)** — 83.5% of generated claims are grounded in the retrieved 10-K context (evaluated across 18 non-null rows; 2 rows are unanswerable edge-cases yielding NaNs).
+* **Answer Relevancy: 0.8983 (89.8%)** — 89.8% direct alignment with user intent, accounting for honest partial refusals.
 
-💻 Tech Stack
--------------
+## 💻 Tech Stack
 
-*   **LLM & Embeddings:** OpenAI (gpt-4o-mini, gpt-4o, text-embedding-3-small)
-    
-*   **Orchestration:** LlamaIndex (v0.10+)
-    
-*   **Vector Database:** Pinecone
-    
-*   **Market Data API:** yfinance
-    
-*   **Evaluation Framework:** Ragas, Pandas, AsyncIO
-    
-*   **Frontend/Deployment:** Streamlit, Hugging Face Spaces
-    
+* **LLM & Embeddings:** OpenAI (`gpt-4o-mini`, `gpt-4o`, `text-embedding-3-small`)
+* **Orchestration:** LlamaIndex (`v0.10+`)
+* **Vector Database:** Pinecone
+* **Market Data API:** yfinance (`fast_info`)
+* **Evaluation Framework:** Ragas, Pandas, AsyncIO
+* **Frontend/Deployment:** Streamlit, Hugging Face Spaces
+* **Testing:** Pytest
 
-🛠️ Running Locally
--------------------
+## 🛠️ Running Locally
 
-1.  git clone https://github.com/aarya-pabha/financial-ai-agent.git
-  
-2.  cd financial-ai-agent
-    
-3.  pip install -r requirements.txt
-    
-4. OPENAI\_API\_KEY="sk-..."PINECONE\_API\_KEY="pcsk\_..."
-    
-5.  streamlit run app.py
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/aarya-pabha/financial-ai-agent.git
+   cd financial-ai-agent
+   ```
+
+2. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   pip install -r requirements-dev.txt   # for tests
+   ```
+
+3. Run the headless test suite:
+   ```bash
+   pytest
+   ```
+
+4. Configure environment variables:
+   ```bash
+   export OPENAI_API_KEY="sk-..."
+   export PINECONE_API_KEY="pcsk_..."
+   ```
+
+5. Launch the Streamlit application:
+   ```bash
+   streamlit run app.py
+   ```

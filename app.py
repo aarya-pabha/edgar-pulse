@@ -1,5 +1,7 @@
 import streamlit as st
 import os
+import logging
+from pathlib import Path
 import pandas as pd
 import yfinance as yf
 from pydantic import BaseModel, Field
@@ -11,6 +13,16 @@ from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.program.openai import OpenAIPydanticProgram
 from llama_index.llms.openai import OpenAI
 from llama_index.core.vector_stores import MetadataFilters, ExactMatchFilter
+
+from rag_guardrails import (
+    check_query_budget,
+    get_symbol_from_csv,
+    safe_extract_market_data,
+    build_synthesis_messages,
+)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # --- 1. PAGE CONFIGURATION ---
 st.set_page_config(
@@ -80,33 +92,31 @@ class RoutePrediction(BaseModel):
 # --- 3. CACHED INITIALIZATION ---
 @st.cache_resource(show_spinner=False)
 def initialize_resources():
-    Settings.llm = OpenAI(model="gpt-4o-mini", temperature=0)
-    Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
+    LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+    EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
+    Settings.llm = OpenAI(model=LLM_MODEL, temperature=0, timeout=30.0, max_retries=2)
+    Settings.embed_model = OpenAIEmbedding(model=EMBED_MODEL)
 
-    # Locate CSV
-    possible_paths = [
-        "nasdaq-listed.csv", "src/nasdaq-listed.csv", 
-        os.path.join(os.getcwd(), "nasdaq-listed.csv"),
-        os.path.join(os.path.dirname(__file__), "nasdaq-listed.csv"),
-        "../nasdaq-listed.csv"
-    ]
-    csv_path = next((p for p in possible_paths if os.path.exists(p)), None)
-    
-    if csv_path:
+    # Locate CSV directly anchored to app location
+    csv_path = Path(__file__).resolve().parent / "nasdaq-listed.csv"
+    if csv_path.exists():
         nasdaq_df = pd.read_csv(csv_path)
         nasdaq_df.columns = [c.strip() for c in nasdaq_df.columns]
     else:
+        logger.warning("nasdaq-listed.csv not found at %s", csv_path)
         nasdaq_df = pd.DataFrame()
 
     # Connect to Pinecone
     try:
         api_key = os.environ.get("PINECONE_API_KEY")
-        if not api_key: raise ValueError("Pinecone Key Missing")
+        if not api_key:
+            raise ValueError("Pinecone Key Missing")
         pc = Pinecone(api_key=api_key)
         index = VectorStoreIndex.from_vector_store(
             vector_store=PineconeVectorStore(pinecone_index=pc.Index("financial-rag-agent"))
         )
-    except:
+    except Exception as e:
+        logger.warning("Pinecone vector store unavailable: %s", e)
         index = None
     
     return nasdaq_df, index
@@ -115,14 +125,6 @@ def initialize_resources():
 nasdaq_df, pinecone_index = initialize_resources()
 
 # --- 4. HELPER FUNCTIONS ---
-def get_symbol_from_csv(query_str: str, df) -> Optional[str]:
-    if df.empty: return None
-    query_str = query_str.strip().upper()
-    if query_str in df['Symbol'].values: return query_str
-    matches = df[df['Security Name'].str.upper().str.contains(query_str, na=False)]
-    if not matches.empty: return matches.loc[matches['Symbol'].str.len().idxmin()]['Symbol']
-    return None
-
 def get_tickers_from_query(query: str, index, df) -> List[str]:
     program = OpenAIPydanticProgram.from_defaults(
         output_cls=TickerExtraction,
@@ -133,44 +135,44 @@ def get_tickers_from_query(query: str, index, df) -> List[str]:
     valid_tickers = []
     for entity in raw_entities:
         ticker = get_symbol_from_csv(entity, df)
-        if not ticker and len(entity) <= 5: ticker = entity.upper()
-        if ticker: valid_tickers.append(ticker)
+        if not ticker and len(entity) <= 5:
+            ticker = entity.upper()
+        if ticker:
+            valid_tickers.append(ticker)
     
     if not valid_tickers and index:
         try:
             nodes = index.as_retriever(similarity_top_k=1).retrieve(query)
             if nodes and nodes[0].metadata.get("ticker"):
                 valid_tickers.append(nodes[0].metadata.get("ticker"))
-        except: pass
+        except Exception as e:
+            logger.debug("Index ticker fallback retrieval failed: %s", e)
     return list(set(valid_tickers))
 
 # --- 5. TOOLS ---
-def get_market_data(query: str, index, df):
+def get_market_data(query: str, index, df) -> str:
     tickers = get_tickers_from_query(query, index, df)
-    if not tickers: return "No companies found."
+    if not tickers:
+        return "No companies found."
     results = []
     for ticker in tickers:
         try:
             stock = yf.Ticker(ticker)
-            info = stock.info
-            data = {
-                "Ticker": ticker,
-                "Price": info.get('currentPrice', 'N/A'),
-                "Market Cap": info.get('marketCap', 'N/A'),
-                "PE Ratio": info.get('trailingPE', 'N/A'),
-                "52w High": info.get('fiftyTwoWeekHigh', 'N/A'),
-                "Volume": info.get('volume', 'N/A'),
-            }
-            results.append(str(data))
+            results.append(safe_extract_market_data(ticker, stock))
         except Exception as e:
-            results.append(f"{ticker}: Data Error ({e})")
+            logger.warning("Failed to retrieve market data for %s: %s", ticker, e)
+            results.append(f"{ticker}: market data currently unavailable")
     return "\n".join(results)
 
-def get_financial_rag(query: str, index, df):
+def get_financial_rag(query: str, index, df) -> dict:
     target_tickers = get_tickers_from_query(query, index, df)
     SUPPORTED = ["AAPL", "TSLA", "NVDA"]
     payload = {"content": "", "sources": [], "raw_nodes": []}
     
+    if index is None:
+        payload["content"] = "[NOTICE: 10-K vector database is currently offline. Deep report analysis is unavailable.]\n"
+        return payload
+
     for ticker in target_tickers:
         if ticker not in SUPPORTED:
             payload["content"] += f"\n[NOTE: No 10-K report available for {ticker}.]\n"
@@ -219,17 +221,23 @@ def run_agent(user_query: str, index, df) -> AgentResponse:
         sources.extend(res["sources"])
         context_used.extend(res["raw_nodes"])
         
-    final_prompt = f"""
-    You are a Wall Street Financial Analyst. Answer using the provided context.
-    Context Data: {results}
-    Instructions:
-    1. Compare Metrics if multiple companies are listed.
-    2. Synthesize qualitative (Risks) and quantitative (Price) data.
-    3. Cite sources.
-    User Query: {user_query}
-    """
-    response_text = Settings.llm.complete(final_prompt).text
+    messages = build_synthesis_messages(user_query, results)
+    chat_response = Settings.llm.chat(messages)
+    response_text = chat_response.message.content
     return AgentResponse(answer=response_text, sources=list(set(sources)), context_used=context_used)
+
+def render_audit_trail(sources: List[str], context: List[str]):
+    """
+    Unified audit trail rendering across both historical conversation and live agent outputs.
+    """
+    with st.expander("🔍 Audit Trail (Read the Source Data)"):
+        st.markdown("### 📚 Cited Sources")
+        st.write(sources)
+        st.divider()
+        st.markdown("### 📄 Raw Context Snippets")
+        for i, ctx in enumerate(context):
+            st.caption(f"**Context Fragment {i+1}:**")
+            st.text(str(ctx))
 
 # --- 7. UI LOGIC ---
 with st.sidebar:
@@ -243,6 +251,9 @@ with st.sidebar:
     
     st.success("**Live Market Data**")
     st.markdown("I can fetch real-time trading metrics for **all companies listed on the NASDAQ**.")
+
+    if pinecone_index is None:
+        st.warning("⚠️ 10-K RAG search is offline (Pinecone index connection not established). Market data remains active.")
     
     st.markdown("---")
     if st.button("🧹 Clear Conversation"):
@@ -277,52 +288,49 @@ with st.expander("💡 View Sample Questions", expanded=True):
     else:
         prompt = None
 
-# Chat State
+# Chat State & Abuse Guard State
 if "messages" not in st.session_state:
     st.session_state.messages = []
+
+if "query_count" not in st.session_state:
+    st.session_state["query_count"] = 0
 
 # Display History
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
-        if "sources" in message:
-             with st.expander("📚 Data Sources & Citations"):
-                 st.write(message["sources"])
-                 st.divider()
-                 for i, c in enumerate(message["context"][:2]):
-                     st.caption(f"**Context Fragment {i+1}:**")
-                     st.text(str(c)[:500] + "...")
+        if "sources" in message and "context" in message:
+            render_audit_trail(message["sources"], message["context"])
 
 # Handle Input (Button or Text)
 if user_input := st.chat_input("Ask a financial question...") or prompt:
     final_query = prompt if prompt else user_input
+
+    # OWASP LLM10 Cost & Abuse Guard
+    is_valid, error_msg = check_query_budget(final_query, st.session_state["query_count"])
+    if not is_valid:
+        st.error(f"⚠️ {error_msg}")
+        st.stop()
+    st.session_state["query_count"] += 1
     
     st.session_state.messages.append({"role": "user", "content": final_query})
     with st.chat_message("user"):
         st.markdown(final_query)
 
     with st.chat_message("assistant"):
-        # The spinner happens here
         with st.status("🧠 Analyzing 10-Ks and Market Data...", expanded=True) as status:
             try:
                 response = run_agent(final_query, pinecone_index, nasdaq_df)
                 status.update(label="✅ Analysis Complete", state="complete", expanded=False)
             except Exception as e:
+                logger.error("Agent execution failed: %s", e)
                 st.error(f"Error: {e}")
                 status.update(label="❌ Error", state="error")
                 st.stop()
 
         # The answer prints outside the status block so it is immediately visible!
         st.markdown(response.answer)
-        
-        # Sources (Collapsible)
-        with st.expander("🔍 Audit Trail (Read the Source Data)"):
-            st.markdown("### 📚 Cited Sources")
-            st.write(response.sources)
-            st.divider()
-            st.markdown("### 📄 Raw Context Snippets")
-            for ctx in response.context_used:
-                st.text(str(ctx))
+        render_audit_trail(response.sources, response.context_used)
         
         # Save to history
         st.session_state.messages.append({
