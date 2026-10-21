@@ -1,24 +1,30 @@
 import streamlit as st
 import os
+import re
 import logging
 from pathlib import Path
 import pandas as pd
-import yfinance as yf
 from pydantic import BaseModel, Field
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Any
 from llama_index.core import VectorStoreIndex, Settings
+from llama_index.core.prompts import PromptTemplate
+from llama_index.core.llms import ChatMessage
 from llama_index.vector_stores.pinecone import PineconeVectorStore
 from pinecone import Pinecone
 from llama_index.embeddings.openai import OpenAIEmbedding
-from llama_index.program.openai import OpenAIPydanticProgram
 from llama_index.llms.openai import OpenAI
-from llama_index.core.vector_stores import MetadataFilters, ExactMatchFilter
 
 from rag_guardrails import (
     check_query_budget,
-    get_symbol_from_csv,
-    safe_extract_market_data,
-    build_synthesis_messages,
+    resolve_tickers,
+    route_query,
+    build_synthesis_chat_template,
+    execute_parallel_tools,
+    get_market_data,
+    get_financial_rag,
+    render_audit_trail,
+    FinalAnswer,
+    AgentResponse,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -65,16 +71,6 @@ if "OPENAI_API_KEY" not in os.environ:
     st.stop()
 
 # --- 2. DATA MODELS (WITH REQUIRED DOCSTRINGS) ---
-class AgentResponse(BaseModel):
-    """
-    Structured output for the financial agent. 
-    Contains the synthesized natural language answer, the list of cited sources, 
-    and the raw context chunks used to formulate the answer.
-    """
-    answer: str
-    sources: List[str]
-    context_used: List[str]
-
 class TickerExtraction(BaseModel):
     """
     Extracts a list of stock tickers or company names mentioned in the user's query.
@@ -124,122 +120,110 @@ def initialize_resources():
 # Silently load resources
 nasdaq_df, pinecone_index = initialize_resources()
 
-# --- 4. HELPER FUNCTIONS ---
-def get_tickers_from_query(query: str, index, df) -> List[str]:
-    program = OpenAIPydanticProgram.from_defaults(
-        output_cls=TickerExtraction,
-        prompt_template_str="Identify all companies in query: {query_str}. Return list.",
-        llm=Settings.llm
+# --- 4. AGENT LOGIC ---
+def run_agent(user_query: str, index: Any, df: pd.DataFrame) -> AgentResponse:
+    """
+    Orchestrates the financial agent pipeline:
+    1. Rules-first router with LLM fallback (P1.2).
+    2. Deterministic ticker resolution once per query, never guessing (P1.1).
+    3. Concurrent execution of market_data and financial_rag (P1.3).
+    4. Single structured synthesis call using FinalAnswer (P1.4).
+    """
+    router_prompt = (
+        "Route the user query to the correct tool based on these strict definitions:\n"
+        "1. 'financial_rag': Company internal details (Revenue, Risks, Strategy, CEO).\n"
+        "2. 'market_data': Real-Time Trading Metrics (Price, PE, Volume) ONLY.\n"
+        "3. 'general_chat': Non-business questions.\n"
+        "Query: {query_str}"
     )
-    raw_entities = program(query_str=query).symbols
-    valid_tickers = []
-    for entity in raw_entities:
-        ticker = get_symbol_from_csv(entity, df)
-        if not ticker and len(entity) <= 5:
-            ticker = entity.upper()
-        if ticker:
-            valid_tickers.append(ticker)
-    
-    if not valid_tickers and index:
-        try:
-            nodes = index.as_retriever(similarity_top_k=1).retrieve(query)
-            if nodes and nodes[0].metadata.get("ticker"):
-                valid_tickers.append(nodes[0].metadata.get("ticker"))
-        except Exception as e:
-            logger.debug("Index ticker fallback retrieval failed: %s", e)
-    return list(set(valid_tickers))
 
-# --- 5. TOOLS ---
-def get_market_data(query: str, index, df) -> str:
-    tickers = get_tickers_from_query(query, index, df)
+    def router_fallback(q: str) -> List[str]:
+        try:
+            res = Settings.llm.structured_predict(
+                RoutePrediction,
+                PromptTemplate(router_prompt),
+                query_str=q
+            )
+            return res.tools
+        except Exception as e:
+            logger.debug("Router LLM fallback failed: %s", e)
+            return ["financial_rag"]
+
+    tools = route_query(user_query, llm_fallback=router_fallback)
+
+    if tools == ["general_chat"]:
+        chat_response = Settings.llm.chat([
+            ChatMessage(
+                role="system",
+                content="You are a helpful Wall Street Financial Analyst AI. Politely answer general questions."
+            ),
+            ChatMessage(role="user", content=user_query)
+        ])
+        return AgentResponse(
+            answer=chat_response.message.content,
+            sources=["General Knowledge"],
+            context_used=[],
+            scratchpad="General inquiry - retrieval skipped.",
+            cited_tickers=[],
+            telemetry={"tools": tools, "llm_calls": 1}
+        )
+
+    def llm_ticker_fallback(q: str) -> List[str]:
+        try:
+            res = Settings.llm.structured_predict(
+                TickerExtraction,
+                PromptTemplate("Identify all company names or stock symbols in: {query_str}. Return list of symbols."),
+                query_str=q
+            )
+            return res.symbols
+        except Exception as e:
+            logger.debug("LLM ticker fallback failed: %s", e)
+            return []
+
+    tickers = resolve_tickers(user_query, df, llm_fallback=llm_ticker_fallback)
+
     if not tickers:
-        return "No companies found."
-    results = []
-    for ticker in tickers:
-        try:
-            stock = yf.Ticker(ticker)
-            results.append(safe_extract_market_data(ticker, stock))
-        except Exception as e:
-            logger.warning("Failed to retrieve market data for %s: %s", ticker, e)
-            results.append(f"{ticker}: market data currently unavailable")
-    return "\n".join(results)
+        return AgentResponse(
+            answer="Which company do you mean? Please specify a company name or ticker symbol (e.g., Apple, TSLA, NVDA).",
+            sources=[],
+            context_used=[],
+            scratchpad="No verified company tickers identified in query.",
+            cited_tickers=[],
+            telemetry={"tools": tools, "llm_calls": 0}
+        )
 
-def get_financial_rag(query: str, index, df) -> dict:
-    target_tickers = get_tickers_from_query(query, index, df)
-    SUPPORTED = ["AAPL", "TSLA", "NVDA"]
-    payload = {"content": "", "sources": [], "raw_nodes": []}
-    
-    if index is None:
-        payload["content"] = "[NOTICE: 10-K vector database is currently offline. Deep report analysis is unavailable.]\n"
-        return payload
+    need_pe = bool(re.search(r"\b(pe|p/e|valuation|earnings)\b", user_query, re.IGNORECASE))
 
-    for ticker in target_tickers:
-        if ticker not in SUPPORTED:
-            payload["content"] += f"\n[NOTE: No 10-K report available for {ticker}.]\n"
-            continue
-            
-        filters = MetadataFilters(filters=[ExactMatchFilter(key="ticker", value=ticker)])
-        engine = index.as_query_engine(similarity_top_k=3, filters=filters)
-        resp = engine.query(query)
-        
-        payload["content"] += f"\n--- {ticker} 10-K Data ---\n{resp.response}\n"
-        for n in resp.source_nodes:
-            payload["sources"].append(f"{n.metadata.get('company')} 10-K")
-            payload["raw_nodes"].append(n.node.get_text())
-            
-    return payload
-
-# --- 6. AGENT LOGIC ---
-def run_agent(user_query: str, index, df) -> AgentResponse:
-    router_prompt = """
-    Route the user query to the correct tool based on these strict definitions:
-    1. "financial_rag": Company internal details (Revenue, Risks, Strategy, CEO).
-    2. "market_data": Real-Time Trading Metrics (Price, PE, Volume) ONLY.
-    3. "general_chat": Non-business questions.
-    Query: {query_str}
-    """
-    router = OpenAIPydanticProgram.from_defaults(
-        output_cls=RoutePrediction,
-        prompt_template_str=router_prompt,
-        llm=Settings.llm
+    tool_results = execute_parallel_tools(
+        tools=tools,
+        query=user_query,
+        tickers=tickers,
+        market_fn=lambda t, pe: get_market_data(t, need_pe=pe),
+        rag_fn=lambda q, t: get_financial_rag(q, t, index),
+        need_pe=need_pe
     )
-    tools = router(query_str=user_query).tools
-    
-    results = {}
-    sources = []
-    context_used = []
-    
-    if "market_data" in tools:
-        res = get_market_data(user_query, index, df)
-        results["market_data"] = res
-        context_used.append(res)
-        sources.append("Real-time Market Data")
-        
-    if "financial_rag" in tools:
-        res = get_financial_rag(user_query, index, df)
-        results["financial_rag"] = res["content"]
-        sources.extend(res["sources"])
-        context_used.extend(res["raw_nodes"])
-        
-    messages = build_synthesis_messages(user_query, results)
-    chat_response = Settings.llm.chat(messages)
-    response_text = chat_response.message.content
-    return AgentResponse(answer=response_text, sources=list(set(sources)), context_used=context_used)
 
-def render_audit_trail(sources: List[str], context: List[str]):
-    """
-    Unified audit trail rendering across both historical conversation and live agent outputs.
-    """
-    with st.expander("🔍 Audit Trail (Read the Source Data)"):
-        st.markdown("### 📚 Cited Sources")
-        st.write(sources)
-        st.divider()
-        st.markdown("### 📄 Raw Context Snippets")
-        for i, ctx in enumerate(context):
-            st.caption(f"**Context Fragment {i+1}:**")
-            st.text(str(ctx))
+    chat_tmpl = build_synthesis_chat_template(
+        user_query=user_query,
+        market_data=tool_results.get("market_data", ""),
+        rag_content=tool_results.get("financial_rag", "")
+    )
 
-# --- 7. UI LOGIC ---
+    final_answer = Settings.llm.structured_predict(
+        FinalAnswer,
+        chat_tmpl
+    )
+
+    return AgentResponse(
+        answer=final_answer.answer,
+        sources=list(dict.fromkeys(tool_results.get("sources", []))),
+        context_used=tool_results.get("context_used", []),
+        scratchpad=final_answer.scratchpad,
+        cited_tickers=final_answer.cited_tickers,
+        telemetry={"tools": tools, "tickers": tickers, "llm_calls": 1}
+    )
+
+# --- 5. UI LOGIC ---
 with st.sidebar:
     st.image("https://img.icons8.com/color/96/000000/bullish.png", width=80)
     
@@ -299,8 +283,8 @@ if "query_count" not in st.session_state:
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
-        if "sources" in message and "context" in message:
-            render_audit_trail(message["sources"], message["context"])
+        if message.get("sources") or message.get("context") or message.get("scratchpad"):
+            render_audit_trail(message)
 
 # Handle Input (Button or Text)
 if user_input := st.chat_input("Ask a financial question...") or prompt:
@@ -330,12 +314,14 @@ if user_input := st.chat_input("Ask a financial question...") or prompt:
 
         # The answer prints outside the status block so it is immediately visible!
         st.markdown(response.answer)
-        render_audit_trail(response.sources, response.context_used)
+        render_audit_trail(response)
         
         # Save to history
         st.session_state.messages.append({
             "role": "assistant", 
             "content": response.answer,
             "sources": response.sources,
-            "context": response.context_used
+            "context": response.context_used,
+            "scratchpad": response.scratchpad,
+            "cited_tickers": response.cited_tickers,
         })

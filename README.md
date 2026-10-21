@@ -54,13 +54,14 @@ Financial SEC 10-K reports contain "Consolidated Financial Statements"—massive
 * **Solution:** Utilizes LlamaIndex's `MarkdownElementNodeParser`. This structural parser treats Markdown tables as atomic elements, refusing to split them.
 * **Trade-off & Fix:** This resulted in massive context chunks (up to 3,000 tokens per table). To ensure the LLM found the exact data without overflowing context windows, the retrieval engine fetches an expanded window (`similarity_top_k=8`) coupled with strict Metadata Filtering (e.g., `ticker='AAPL'`) to prevent cross-company data contamination.
 
-### 2. The Pydantic Semantic Router
+### 2. High-Performance Deterministic Router & Execution Engine
 
-The core decision engine is powered by an `OpenAIPydanticProgram`. Instead of letting the LLM guess how to answer, the router enforces strict tool selection:
+The decision engine combines deterministic rules-first routing with structured LLM fallback and true parallel tool execution:
 
-* **Tool 1 (`financial_rag`):** Triggered for internal company details, historical revenue, risks, and strategy. Queries Pinecone vector index.
-* **Tool 2 (`market_data`):** Triggered for real-time trading metrics (Price, Market Cap, Volume). Queries `yfinance.fast_info` (<150ms latency) with graceful fallback.
-* **Hybrid Mode:** If a user asks *"Compare Tesla's current price to its supply chain risks"*, the router triggers both tools and synthesizes the final comparative answer.
+* **Deterministic Ticker Resolution:** Resolves symbols once per query via curated alias maps, NASDAQ symbol lookups, and finance-acronym stoplists. Never hallucinates unverified tickers or guesses random nodes.
+* **Rules-First Router:** Evaluates word-boundary regexes for sub-millisecond classification, falling back to LlamaIndex structured prediction (`Settings.llm.structured_predict`) only when rules are ambiguous.
+* **True Parallel Execution:** Runs `market_data` (`yfinance.fast_info` <150ms) and `financial_rag` (`similarity_top_k=8`, `MetadataMode.LLM`) concurrently using `concurrent.futures.ThreadPoolExecutor(max_workers=2)`.
+* **Single-Call Structured Synthesis:** Eliminates per-ticker summarization calls, feeding raw labeled chunks into a single `FinalAnswer` synthesis call with reasoning scratchpads.
 * **Cost & Abuse Guard:** Protected against OWASP LLM10 unbounded consumption with per-query length limits (1,000 chars) and per-session quotas (25 queries).
 
 ## 📊 Rigorous Evaluation Pipeline (Ragas)

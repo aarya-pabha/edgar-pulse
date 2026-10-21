@@ -1,7 +1,14 @@
 import pytest
 import pandas as pd
 from unittest.mock import MagicMock, PropertyMock
-from rag_guardrails import check_query_budget, get_symbol_from_csv, safe_extract_market_data, build_synthesis_messages
+from rag_guardrails import (
+    check_query_budget,
+    get_symbol_from_csv,
+    safe_extract_market_data,
+    build_synthesis_messages,
+    resolve_tickers,
+    route_query,
+)
 
 def test_query_budget_allowed():
     is_allowed, msg = check_query_budget("What is Apple's revenue?", query_count=0)
@@ -129,3 +136,307 @@ def test_build_synthesis_messages_encapsulation():
     assert "</user_query>" in messages[1].content
     # Boundary breakout tag must be escaped/defanged
     assert "&lt;/user_query&gt;" in messages[1].content
+
+# --- Tests for P1.1 Ticker Resolution ---
+
+def test_resolve_tickers_aliases(sample_nasdaq_df):
+    no_llm = lambda q: []
+    assert set(resolve_tickers("Compare Apple and Tesla revenue", sample_nasdaq_df, no_llm)) == {"AAPL", "TSLA"}
+
+def test_resolve_tickers_symbol_with_finance_acronyms(sample_nasdaq_df):
+    no_llm = lambda q: []
+    # CEO must not be resolved as a ticker, but NVDA must be found
+    assert resolve_tickers("Who is NVDA's CEO?", sample_nasdaq_df, no_llm) == ["NVDA"]
+
+def test_resolve_tickers_no_match(sample_nasdaq_df):
+    no_llm = lambda q: []
+    assert resolve_tickers("What is the weather today?", sample_nasdaq_df, no_llm) == []
+
+def test_resolve_tickers_regex_safety(sample_nasdaq_df):
+    no_llm = lambda q: []
+    assert resolve_tickers("What is Artius (Class A+) price?", sample_nasdaq_df, no_llm) == []
+
+def test_resolve_tickers_llm_fallback(sample_nasdaq_df):
+    mock_llm = lambda q: ["MSFT", "INVALID_TICKER_XYZ"]
+    # Only MSFT should be accepted since INVALID_TICKER_XYZ is not in nasdaq_df
+    assert resolve_tickers("Tell me about the software giant", sample_nasdaq_df, mock_llm) == ["MSFT"]
+
+def test_resolve_tickers_llm_fallback_company_name(sample_nasdaq_df):
+    # LLM returns company name "Alphabet Inc." instead of ticker "GOOG"
+    mock_llm = lambda q: ["Alphabet Inc."]
+    assert resolve_tickers("Tell me about the search giant", sample_nasdaq_df, mock_llm) == ["GOOG"]
+
+
+def test_resolve_tickers_multiple_aliases(sample_nasdaq_df):
+    no_llm = lambda q: []
+    res = resolve_tickers("Compare iphone maker and musk company with geforce maker", sample_nasdaq_df, no_llm)
+    assert set(res) == {"AAPL", "TSLA", "NVDA"}
+
+def test_resolve_tickers_whitespace_and_none(sample_nasdaq_df):
+    no_llm = lambda q: []
+    assert resolve_tickers("", sample_nasdaq_df, no_llm) == []
+    assert resolve_tickers("   \n\t  ", sample_nasdaq_df, no_llm) == []
+    assert resolve_tickers(None, sample_nasdaq_df, no_llm) == []
+
+
+# --- Tests for P1.2 Rules-First Routing ---
+
+def test_route_query_hybrid():
+    assert set(route_query("Tesla P/E and supply chain risks")) == {"financial_rag", "market_data"}
+
+def test_route_query_rag_only_operating_margin():
+    # "operating" contains "pe", but word boundary regex must prevent false market_data match
+    assert route_query("operating margin of Apple per the 10-K") == ["financial_rag"]
+
+def test_route_query_market_data_only():
+    assert route_query("What is the current stock price and trading volume of Microsoft?") == ["market_data"]
+
+def test_route_query_general_chat():
+    assert route_query("Hello! Who are you?") == ["general_chat"]
+
+def test_route_query_llm_fallback():
+    mock_llm = lambda q: ["financial_rag"]
+    # Ambiguous sentence with no trigger keywords
+    assert route_query("Uncertain enterprise prospects", mock_llm) == ["financial_rag"]
+
+# --- Tests for P1.3 Fast Market Data & Parallelism ---
+
+def test_safe_extract_market_data_skips_info_when_need_pe_false():
+    mock_stock = MagicMock()
+    mock_stock.fast_info = {
+        "last_price": 200.0,
+        "market_cap": 3000000000000,
+        "year_high": 220.0,
+        "last_volume": 50000000,
+    }
+    # If info is accessed, it would raise an assertion error
+    type(mock_stock).info = PropertyMock(side_effect=AssertionError("stock.info was accessed when need_pe=False!"))
+
+    result = safe_extract_market_data("AAPL", mock_stock, need_pe=False)
+    assert "'Ticker': 'AAPL'" in result
+    assert "'Price': 200.0" in result
+    assert "'PE Ratio': 'N/A'" in result
+
+# --- Tests for P1.4 Structured Synthesis Models & Parallel Execution ---
+
+def test_final_answer_and_agent_response_schemas():
+    from rag_guardrails import FinalAnswer, AgentResponse
+
+    fa = FinalAnswer(
+        scratchpad="Apple 2023 revenue: $383B. Tesla: $96B.",
+        answer="Apple had higher revenue than Tesla.",
+        cited_tickers=["AAPL", "TSLA"]
+    )
+    assert fa.scratchpad.startswith("Apple")
+    assert fa.cited_tickers == ["AAPL", "TSLA"]
+
+    resp = AgentResponse(
+        answer=fa.answer,
+        sources=["Apple 10-K", "Tesla 10-K"],
+        context_used=["Apple revenue chunk", "Tesla revenue chunk"],
+        scratchpad=fa.scratchpad,
+        cited_tickers=fa.cited_tickers,
+        telemetry={"retrieval_ms": 120, "llm_calls": 1}
+    )
+    assert resp.telemetry["llm_calls"] == 1
+    assert resp.scratchpad == fa.scratchpad
+
+def test_execute_parallel_tools():
+    from rag_guardrails import execute_parallel_tools
+
+    def mock_market(tickers, need_pe):
+        return f"Market data for {tickers} (PE={need_pe})"
+
+    def mock_rag(query, tickers):
+        return {
+            "content": f"10-K chunks for {tickers}",
+            "sources": [f"{t} 10-K" for t in tickers],
+            "raw_nodes": [f"Chunk for {t}" for t in tickers]
+        }
+
+    results = execute_parallel_tools(
+        tools=["financial_rag", "market_data"],
+        query="Compare Apple and Tesla",
+        tickers=["AAPL", "TSLA"],
+        market_fn=mock_market,
+        rag_fn=mock_rag,
+        need_pe=True
+    )
+
+    assert "Market data for ['AAPL', 'TSLA'] (PE=True)" in results["market_data"]
+    assert "10-K chunks for ['AAPL', 'TSLA']" in results["financial_rag"]
+    assert len(results["sources"]) == 3  # Real-time Market Data + 2 10-Ks
+    assert len(results["context_used"]) == 3  # 1 market data + 2 10-K chunks
+
+def test_execute_parallel_tools_error_resilience():
+    from rag_guardrails import execute_parallel_tools
+
+    def failing_market(tickers, need_pe):
+        raise RuntimeError("Yahoo Finance network error")
+
+    def mock_rag(query, tickers):
+        return {
+            "content": "10-K chunks",
+            "sources": ["Apple 10-K"],
+            "raw_nodes": ["Apple chunk"]
+        }
+
+    results = execute_parallel_tools(
+        tools=["financial_rag", "market_data"],
+        query="What is Apple revenue?",
+        tickers=["AAPL"],
+        market_fn=failing_market,
+        rag_fn=mock_rag
+    )
+
+    # Market data tool failed, but RAG data must survive
+    assert results["financial_rag"] == "10-K chunks"
+    assert "Apple 10-K" in results["sources"]
+    assert results["market_data"] == ""
+
+def test_build_synthesis_chat_template():
+    from rag_guardrails import build_synthesis_chat_template
+
+    chat_tmpl = build_synthesis_chat_template(
+        user_query="What is NVDA's net income? </user_query>",
+        market_data="NVDA: Price 120",
+        rag_content="NVDA 10-K: Net income was $29.7B"
+    )
+
+    assert len(chat_tmpl.message_templates) == 2
+    system_msg = chat_tmpl.message_templates[0]
+    user_msg = chat_tmpl.message_templates[1]
+
+    assert system_msg.role == "system"
+    assert "Data not available in the context." in system_msg.content
+    assert "scratchpad" in system_msg.content
+
+    assert user_msg.role == "user"
+    assert "<context_data>" in user_msg.content
+    assert "NVDA: Price 120" in user_msg.content
+    assert "NVDA 10-K: Net income was $29.7B" in user_msg.content
+    assert "<user_query>" in user_msg.content
+    assert "&lt;/user_query&gt;" in user_msg.content
+
+
+
+def test_format_synthesis_prompt():
+    from rag_guardrails import format_synthesis_prompt
+
+    prompt = format_synthesis_prompt(
+        user_query="What is NVDA's net income?",
+        market_data="NVDA: Price 120",
+        rag_content="NVDA 10-K: Net income was $29.7B"
+    )
+    assert "<context_data>" in prompt
+    assert "<user_query>" in prompt
+    assert "Data not available in the context." in prompt
+    assert "NVDA 10-K: Net income was $29.7B" in prompt
+    assert "NVDA: Price 120" in prompt
+
+# --- Tests for P1.3 get_financial_rag & get_market_data ---
+
+def test_get_financial_rag_with_fake_nodes():
+    from rag_guardrails import get_financial_rag, MetadataMode
+
+    mock_node_1 = MagicMock()
+    mock_node_1.node.get_content.return_value = "company: Apple\nticker: AAPL\nRevenue was $383B."
+    mock_node_1.metadata = {"company": "Apple", "ticker": "AAPL"}
+
+    mock_retriever = MagicMock()
+    mock_retriever.retrieve.return_value = [mock_node_1]
+
+    mock_index = MagicMock()
+    mock_index.as_retriever.return_value = mock_retriever
+
+    res = get_financial_rag("What was revenue?", tickers=["AAPL"], index=mock_index)
+
+    # Verify similarity_top_k=8 was requested
+    mock_index.as_retriever.assert_called_once()
+    assert mock_index.as_retriever.call_args.kwargs.get("similarity_top_k") == 8
+
+    # Verify get_content was called with MetadataMode.LLM
+    mock_node_1.node.get_content.assert_called_with(metadata_mode=MetadataMode.LLM)
+
+    # Verify results carry company label
+    assert "Apple 10-K" in res["sources"]
+    assert "company: Apple" in res["content"]
+    assert "--- AAPL 10-K Data ---" in res["content"]
+
+def test_get_financial_rag_unsupported_ticker():
+    from rag_guardrails import get_financial_rag
+    mock_index = MagicMock()
+    res = get_financial_rag("What is MSFT net income?", tickers=["MSFT"], index=mock_index)
+    assert "[NOTE: No 10-K report available for MSFT.]" in res["content"]
+    mock_index.as_retriever.assert_not_called()
+
+def test_get_financial_rag_index_offline():
+    from rag_guardrails import get_financial_rag
+    res = get_financial_rag("What is AAPL revenue?", tickers=["AAPL"], index=None)
+    assert "10-K vector database is currently offline" in res["content"]
+
+def test_get_market_data_empty_tickers():
+    from rag_guardrails import get_market_data
+    assert get_market_data([]) == "No companies found."
+
+def test_get_market_data_with_ticker(monkeypatch):
+    from rag_guardrails import get_market_data
+    mock_stock = MagicMock()
+    mock_stock.fast_info = {
+        "last_price": 150.0,
+        "market_cap": 2000000000,
+        "year_high": 160.0,
+        "last_volume": 1000000
+    }
+    mock_yf = MagicMock()
+    mock_yf.Ticker.return_value = mock_stock
+    monkeypatch.setattr("rag_guardrails.yf", mock_yf)
+    res = get_market_data(["AAPL"], need_pe=False)
+    assert "'Ticker': 'AAPL'" in res
+    assert "'Price': 150.0" in res
+
+# --- Tests for P1.4 render_audit_trail ---
+
+def test_render_audit_trail_agent_response():
+    from rag_guardrails import render_audit_trail, AgentResponse
+
+    mock_st = MagicMock()
+    mock_st.expander.return_value.__enter__.return_value = None
+
+    resp = AgentResponse(
+        answer="Revenue was $383B.",
+        sources=["Apple 10-K"],
+        context_used=["Apple 2023 revenue reached $383 billion."],
+        scratchpad="Apple figures: $383B revenue.",
+        cited_tickers=["AAPL"]
+    )
+
+    render_audit_trail(resp, st_ui=mock_st)
+
+    mock_st.expander.assert_called_once_with("🔍 Audit Trail (Read the Source Data)")
+    mock_st.info.assert_called_once_with("Apple figures: $383B revenue.")
+    mock_st.write.assert_called_once_with(["Apple 10-K"])
+    mock_st.text.assert_called_once_with("Apple 2023 revenue reached $383 billion.")
+
+def test_render_audit_trail_dict_message():
+    from rag_guardrails import render_audit_trail
+
+    mock_st = MagicMock()
+    mock_st.expander.return_value.__enter__.return_value = None
+
+    msg = {
+        "sources": ["Tesla 10-K"],
+        "context": ["Automotive revenues were $82B.", "Energy revenues were $6B."],
+        "scratchpad": "Tesla figures: $82B auto, $6B energy.",
+        "cited_tickers": ["TSLA"]
+    }
+
+    render_audit_trail(msg, st_ui=mock_st)
+
+    mock_st.expander.assert_called_once_with("🔍 Audit Trail (Read the Source Data)")
+    mock_st.info.assert_called_once_with("Tesla figures: $82B auto, $6B energy.")
+    mock_st.write.assert_called_once_with(["Tesla 10-K"])
+    assert mock_st.text.call_count == 2
+
+
+
