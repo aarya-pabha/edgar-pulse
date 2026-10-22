@@ -668,10 +668,30 @@ def test_reciprocal_rank_fusion_logic():
     assert reciprocal_rank_fusion([]) == []
     assert len(reciprocal_rank_fusion([[]])) == 0
 
+def test_get_llm_factory():
+    from rag_guardrails import get_llm
+    import os
 
+    # Test GPT-6 luna initialization
+    llm6 = get_llm("gpt-6-luna")
+    assert llm6 is not None
+    assert llm6.model == "gpt-6-luna"
+    assert llm6.temperature == 1.0
+    assert llm6.additional_kwargs.get("reasoning_effort") == "none"
 
+    # Test legacy gpt-4o-mini initialization
+    llm4 = get_llm("gpt-4o-mini")
+    assert llm4 is not None
+    assert llm4.model == "gpt-4o-mini"
+    assert llm4.temperature == 0.0
 
-
-
-
-
+    # Test default fallback when env not set
+    orig_env = os.environ.get("LLM_MODEL")
+    try:
+        if "LLM_MODEL" in os.environ:
+            del os.environ["LLM_MODEL"]
+        llm_default = get_llm()
+        assert llm_default.model == "gpt-6-luna"
+    finally:
+        if orig_env:
+            os.environ["LLM_MODEL"] = orig_env

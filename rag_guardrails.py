@@ -65,6 +65,48 @@ def load_env(env_path: Optional[Union[str, Path]] = None) -> None:
                     if k_clean and k_clean not in os.environ:
                         os.environ[k_clean] = v.strip().strip("'\"")
 
+def get_llm(model_name: Optional[str] = None, timeout: float = 30.0, max_retries: int = 2) -> Any:
+    """
+    Factory for OpenAI LLM instances supporting GPT-6, GPT-5, and legacy models (P3.2).
+    Registers modern models into llama_index utils and applies optimal temperature/reasoning kwargs.
+    """
+    try:
+        from llama_index.llms.openai import OpenAI
+    except ImportError:
+        logger.warning("llama_index.llms.openai is not installed.")
+        return None
+
+    model = model_name or os.getenv("LLM_MODEL", "gpt-6-luna")
+
+    try:
+        import llama_index.llms.openai.utils as utils
+        registered_models = [
+            "gpt-6-luna", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-astra",
+            "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5-mini", "gpt-5-nano"
+        ]
+        for m in registered_models:
+            utils.ALL_AVAILABLE_MODELS.setdefault(m, 128000)
+            utils.CHAT_MODELS.setdefault(m, 128000)
+        utils.ALL_AVAILABLE_MODELS.setdefault(model, 128000)
+        utils.CHAT_MODELS.setdefault(model, 128000)
+    except Exception as e:
+        logger.debug("Failed to register models in llama_index utils: %s", e)
+
+    if model.startswith("gpt-6") or model.startswith("o1") or model.startswith("o3") or model.startswith("o4"):
+        return OpenAI(
+            model=model,
+            temperature=1.0,
+            timeout=timeout,
+            max_retries=max_retries,
+            additional_kwargs={"reasoning_effort": "none"}
+        )
+    return OpenAI(
+        model=model,
+        temperature=0.0,
+        timeout=timeout,
+        max_retries=max_retries
+    )
+
 # --- Pydantic Data Models (P1.4) ---
 
 class FinalAnswer(BaseModel):

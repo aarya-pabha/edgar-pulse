@@ -10,6 +10,7 @@ from typing import List, Literal, Optional, Any
 
 from rag_guardrails import (
     load_env,
+    get_llm,
     check_query_budget,
     check_prompt_injection,
     resolve_tickers,
@@ -114,9 +115,9 @@ def initialize_pinecone_index():
     """
     Caches the Pinecone VectorStoreIndex connection using st.cache_resource (Context7: shared singleton).
     """
-    LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+    LLM_MODEL = os.getenv("LLM_MODEL", "gpt-6-luna")
     EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
-    Settings.llm = OpenAI(model=LLM_MODEL, temperature=0, timeout=30.0, max_retries=2)
+    Settings.llm = get_llm(LLM_MODEL, timeout=30.0, max_retries=2)
     Settings.embed_model = OpenAIEmbedding(model=EMBED_MODEL)
 
     try:
