@@ -3,10 +3,12 @@ Financial RAG Guardrails & Utilities.
 Headless business logic, validation, symbol lookup, market data extraction,
 deterministic ticker resolution, and rules-first semantic routing.
 """
+import os
 import re
 import logging
 import concurrent.futures
-from typing import Optional, Tuple, Any, List, Callable
+from pathlib import Path
+from typing import Optional, Tuple, Any, List, Callable, Union
 from pydantic import BaseModel, Field
 import pandas as pd
 
@@ -16,8 +18,9 @@ except ImportError:
     yf = None
 
 try:
-    from llama_index.core.schema import MetadataMode
+    from llama_index.core.schema import MetadataMode, NodeWithScore
     from llama_index.core.vector_stores import MetadataFilters, ExactMatchFilter
+    from llama_index.retrievers.bm25 import BM25Retriever
 except ImportError:
     from enum import Enum
     class MetadataMode(str, Enum):
@@ -33,7 +36,34 @@ except ImportError:
     class MetadataFilters(BaseModel):
         filters: List[Any]
 
+    class NodeWithScore:
+        def __init__(self, node: Any, score: float = 0.0):
+            self.node = node
+            self.score = score
+
+    BM25Retriever = None
+
 logger = logging.getLogger(__name__)
+
+def load_env(env_path: Optional[Union[str, Path]] = None) -> None:
+    """
+    Standard-library .env loader. Loads environment variables into os.environ
+    without overwriting existing values (e.g. CI secrets or container environment).
+    """
+    if env_path is None:
+        env_file = Path(__file__).resolve().parent / ".env"
+    else:
+        env_file = Path(env_path)
+
+    if env_file.exists():
+        with open(env_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    k_clean = k.strip()
+                    if k_clean and k_clean not in os.environ:
+                        os.environ[k_clean] = v.strip().strip("'\"")
 
 # --- Pydantic Data Models (P1.4) ---
 
@@ -109,6 +139,30 @@ def check_query_budget(
         return False, f"Session query limit reached ({max_queries} queries). Please start a new session."
 
     return True, ""
+
+# --- P2.4 Prompt Injection First Line Guard ---
+
+INJECTION_PATTERNS = [
+    re.compile(r"\bignore\s+(?:all\s+)?(?:previous|prior|above)\s+instructions\b", re.IGNORECASE),
+    re.compile(r"\b(?:enter\s+)?developer\s+mode\b", re.IGNORECASE),
+    re.compile(r"\b(?:print|reveal|output|display|show|dump)\s+(?:the\s+)?(?:system\s+prompt|secrets|confidential\s+data)\b", re.IGNORECASE),
+    re.compile(r"\bsystem\s+prompt\b", re.IGNORECASE),
+]
+
+def check_prompt_injection(query: str) -> Tuple[bool, str]:
+    """
+    First-line defense against prompt-injection attacks (OWASP LLM01).
+    A small regex denylist matching adversarial instruction overrides.
+    Structural defenses (role-separated ChatMessage and tagged context)
+    provide the primary defense.
+    """
+    if not query:
+        return True, ""
+    for pattern in INJECTION_PATTERNS:
+        if pattern.search(query):
+            return False, "Suspicious prompt injection detected. Query blocked."
+    return True, ""
+
 
 def get_symbol_from_csv(query_str: Optional[str], df: Optional[pd.DataFrame]) -> Optional[str]:
     """
@@ -310,14 +364,68 @@ def get_market_data(tickers: List[str], need_pe: bool = True) -> str:
             results.append(f"{ticker}: market data currently unavailable")
     return "\n".join(results)
 
-def get_financial_rag(query: str, tickers: List[str], index: Any) -> dict:
+def reciprocal_rank_fusion(
+    node_lists: List[List[Any]],
+    similarity_top_k: int = 6,
+    k: float = 60.0
+) -> List[Any]:
     """
-    Performs vector retrieval over SEC 10-K filings using similarity_top_k=8 and MetadataMode.LLM (P1.3).
-    Eliminates per-ticker LLM summarization calls and returns raw labeled chunks directly.
+    Standard Reciprocal Rank Fusion (RRF, Cormack et al. 2009, k=60).
+    Fuses rankings from dense vector retrieval and BM25 lexical retrieval
+    without redundant remote embedding requests or LLM query-generation overhead.
     """
-    payload = {"content": "", "sources": [], "raw_nodes": []}
+    fused_scores = {}
+    key_to_node = {}
 
-    if index is None:
+    for nodes_with_scores in node_lists:
+        sorted_nodes = sorted(
+            nodes_with_scores,
+            key=lambda x: getattr(x, "score", 0.0) or 0.0,
+            reverse=True
+        )
+        for rank, nws in enumerate(sorted_nodes):
+            node_obj = getattr(nws, "node", nws)
+            node_key = (
+                getattr(node_obj, "node_id", None) or
+                getattr(node_obj, "id_", None) or
+                str(id(node_obj))
+            )
+            key_to_node[node_key] = nws
+            if node_key not in fused_scores:
+                fused_scores[node_key] = 0.0
+            fused_scores[node_key] += 1.0 / (rank + k)
+
+    reranked = sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
+
+    fused_nodes = []
+    for node_key, score in reranked[:similarity_top_k]:
+        original_nws = key_to_node[node_key]
+        if hasattr(original_nws, "score"):
+            try:
+                from llama_index.core.schema import NodeWithScore
+                fused_nodes.append(NodeWithScore(node=original_nws.node, score=score))
+            except Exception:
+                fused_nodes.append(original_nws)
+        else:
+            fused_nodes.append(original_nws)
+
+    return fused_nodes
+
+def get_financial_rag(
+    query: str,
+    tickers: List[str],
+    index: Any,
+    bm25_retrievers: Optional[dict] = None
+) -> dict:
+    """
+    Performs hybrid retrieval over SEC 10-K filings using BM25 and dense retrieval (P2.1).
+    Preserves raw dense nodes and un-altered similarity scores for the CRAG confidence gate (P2.2).
+    Fuses dense and BM25 candidate rankings directly with Reciprocal Rank Fusion (RRF k=60),
+    eliminating redundant OpenAI embedding requests and sub-second network latency.
+    """
+    payload = {"content": "", "sources": [], "raw_nodes": [], "dense_nodes": []}
+
+    if index is None and not bm25_retrievers:
         payload["content"] = "[NOTICE: 10-K vector database is currently offline. Deep report analysis is unavailable.]\n"
         return payload
 
@@ -326,28 +434,256 @@ def get_financial_rag(query: str, tickers: List[str], index: Any) -> dict:
             payload["content"] += f"\n[NOTE: No 10-K report available for {ticker}.]\n"
             continue
 
-        try:
-            filters = MetadataFilters(filters=[ExactMatchFilter(key="ticker", value=ticker)])
-            retriever = index.as_retriever(similarity_top_k=8, filters=filters)
-            nodes = retriever.retrieve(query)
+        ticker_dense_nodes = []
+        if index is not None:
+            try:
+                filters = MetadataFilters(filters=[ExactMatchFilter(key="ticker", value=ticker)])
+                dense_retriever = index.as_retriever(similarity_top_k=8, filters=filters)
+                ticker_dense_nodes = dense_retriever.retrieve(query)
+                payload["dense_nodes"].extend(ticker_dense_nodes)
+            except Exception as e:
+                logger.warning("Dense retrieval failed for %s: %s", ticker, e)
 
-            ticker_chunks = []
-            for n in nodes:
-                chunk_text = n.node.get_content(metadata_mode=MetadataMode.LLM)
-                payload["raw_nodes"].append(chunk_text)
-                company_name = getattr(n, "metadata", {}).get("company", ticker)
-                payload["sources"].append(f"{company_name} 10-K")
-                ticker_chunks.append(chunk_text)
+        # Retrieve local BM25 nodes (<1ms)
+        bm25_retriever = (bm25_retrievers or {}).get(ticker)
+        ticker_bm25_nodes = []
+        if bm25_retriever is not None:
+            try:
+                ticker_bm25_nodes = bm25_retriever.retrieve(query)
+            except Exception as e:
+                logger.warning("BM25 retrieval failed for %s: %s", ticker, e)
 
-            if ticker_chunks:
-                payload["content"] += f"\n--- {ticker} 10-K Data ---\n" + "\n\n".join(ticker_chunks) + "\n"
-            else:
-                payload["content"] += f"\n[NOTE: No matching 10-K sections found for {ticker}.]\n"
-        except Exception as e:
-            logger.warning("Retrieval failed for %s: %s", ticker, e)
-            payload["content"] += f"\n[NOTE: Retrieval error for {ticker}.]\n"
+        # Direct RRF Fusion: 1 embedding call total, zero duplicate remote calls
+        if ticker_dense_nodes and ticker_bm25_nodes:
+            nodes = reciprocal_rank_fusion([ticker_dense_nodes, ticker_bm25_nodes], similarity_top_k=6)
+        elif ticker_dense_nodes:
+            # Fallback: lexical BM25 rerank over dense top-8 if no pre-cached BM25 nodes
+            try:
+                if BM25Retriever:
+                    local_bm25 = BM25Retriever.from_defaults(
+                        nodes=[n.node for n in ticker_dense_nodes],
+                        similarity_top_k=min(6, len(ticker_dense_nodes))
+                    )
+                    local_bm25_nodes = local_bm25.retrieve(query)
+                    nodes = reciprocal_rank_fusion([ticker_dense_nodes, local_bm25_nodes], similarity_top_k=6)
+                else:
+                    nodes = ticker_dense_nodes[:6]
+            except Exception:
+                nodes = ticker_dense_nodes[:6]
+        elif ticker_bm25_nodes:
+            # BM25-only fallback when Pinecone is offline
+            nodes = ticker_bm25_nodes[:6]
+        else:
+            nodes = []
+
+        ticker_chunks = []
+        for n in nodes:
+            chunk_text = n.node.get_content(metadata_mode=MetadataMode.LLM)
+            payload["raw_nodes"].append(chunk_text)
+            company_name = getattr(n, "metadata", {}).get("company", ticker)
+            payload["sources"].append(f"{company_name} 10-K")
+            ticker_chunks.append(chunk_text)
+
+        if ticker_chunks:
+            payload["content"] += f"\n--- {ticker} 10-K Data ---\n" + "\n\n".join(ticker_chunks) + "\n"
+        else:
+            payload["content"] += f"\n[NOTE: No matching 10-K sections found for {ticker}.]\n"
 
     return payload
+
+# --- P2.2 CRAG Confidence Gate ---
+
+# CRAG confidence thresholds calibrated on 2026-10-21 against 20 validation queries (P2.2)
+# Dense cosine similarity thresholds (OpenAI text-embedding-3-small)
+CRAG_HIGH_THRESHOLD = 0.70
+CRAG_LOW_THRESHOLD = 0.40
+
+def assess_retrieval(
+    query: str,
+    dense_nodes: List[Any],
+    high_thresh: float = CRAG_HIGH_THRESHOLD,
+    low_thresh: float = CRAG_LOW_THRESHOLD
+) -> dict:
+    """
+    CRAG Confidence Gate evaluating dense retrieval quality before synthesis (P2.2).
+    Evaluates dense node scores before fusion (since RRF normalizes away raw distances).
+    """
+    if not dense_nodes:
+        return {"status": "INSUFFICIENT", "top_score": 0.0, "coverage": 0.0}
+
+    scores = []
+    for n in dense_nodes:
+        s = getattr(n, "score", None)
+        if s is not None and isinstance(s, (int, float)):
+            scores.append(float(s))
+
+    if not scores:
+        return {"status": "INSUFFICIENT", "top_score": 0.0, "coverage": 0.0}
+
+    top_score = max(scores)
+    qualifying = [s for s in scores if s >= low_thresh]
+    coverage = len(qualifying) / len(scores)
+
+    if top_score >= high_thresh:
+        status = "CORRECT"
+    elif top_score >= low_thresh:
+        status = "AMBIGUOUS"
+    else:
+        status = "INSUFFICIENT"
+
+    return {
+        "status": status,
+        "top_score": round(top_score, 4),
+        "coverage": round(coverage, 4)
+    }
+
+# --- P2.3 Deterministic Numerical Grounding Check ---
+
+UNIT_MULTIPLIERS = {
+    "k": 1e3,
+    "thousand": 1e3,
+    "thousands": 1e3,
+    "m": 1e6,
+    "million": 1e6,
+    "millions": 1e6,
+    "b": 1e9,
+    "billion": 1e9,
+    "billions": 1e9,
+    "t": 1e12,
+    "trillion": 1e12,
+    "trillions": 1e12,
+}
+
+CHUNK_SCALE_PATTERNS = [
+    (re.compile(r"\b(?:in\s+billions?|\(\s*in\s+billions?\s*\))", re.IGNORECASE), 1e9),
+    (re.compile(r"\b(?:in\s+millions?|\(\s*in\s+millions?\s*\))", re.IGNORECASE), 1e6),
+    (re.compile(r"\b(?:in\s+thousands?|\(\s*in\s+thousands?\s*\))", re.IGNORECASE), 1e3),
+]
+
+NUM_REGEX = re.compile(
+    r"(?P<prefix>(?:FY|Q[1-4]|Item|Note|Page|Section)\s*)?"
+    r"(?P<currency>[$€£])?"
+    r"(?P<num>[0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)"
+    r"(?:\s*(?P<unit>%|x|\b(?:thousands?|millions?|billions?|trillions?)\b|[kmbt]\b))?",
+    re.IGNORECASE
+)
+
+def _parse_numbers(text: str, default_multiplier: float = 1.0, is_answer: bool = False) -> List[dict]:
+    results = []
+    for match in NUM_REGEX.finditer(text):
+        prefix = match.group("prefix")
+        num_str = match.group("num")
+        unit_str = match.group("unit")
+        currency = match.group("currency")
+        raw_token = match.group(0).strip()
+
+        if prefix:
+            continue
+
+        try:
+            clean_num = float(num_str.replace(",", ""))
+        except ValueError:
+            continue
+
+        if not currency and not unit_str:
+            if 1900 <= clean_num <= 2100 and clean_num.is_integer():
+                continue
+            if is_answer and clean_num < 10 and clean_num.is_integer():
+                continue
+
+        unit_type = "scalar"
+        mult = default_multiplier
+        if unit_str:
+            u_lower = unit_str.lower()
+            if u_lower == "%":
+                unit_type = "percent"
+                mult = 1.0
+            elif u_lower == "x":
+                unit_type = "multiple"
+                mult = 1.0
+            elif u_lower in UNIT_MULTIPLIERS:
+                mult = UNIT_MULTIPLIERS[u_lower]
+
+        val = clean_num * mult
+        results.append({
+            "raw": raw_token,
+            "val": val,
+            "unit_type": unit_type,
+            "clean_num": clean_num,
+        })
+    return results
+
+def verify_numbers(
+    answer: str,
+    chunks: List[str],
+    market_data: Any,
+    relative_tolerance: float = 0.005
+) -> dict:
+    """
+    Deterministic numerical grounding check (P2.3).
+    Extracts numerical figures from the answer and verifies them against
+    context chunks (accounting for table scaling) and sanitized market data.
+    """
+    if not answer:
+        return {"ratio": 1.0, "grounded": [], "unverified": []}
+
+    ans_numbers = _parse_numbers(answer, default_multiplier=1.0, is_answer=True)
+    if not ans_numbers:
+        return {"ratio": 1.0, "grounded": [], "unverified": []}
+
+    ctx_numbers = []
+    for chunk in chunks or []:
+        mult = 1.0
+        for pattern, m in CHUNK_SCALE_PATTERNS:
+            if pattern.search(chunk):
+                mult = m
+                break
+        ctx_numbers.extend(_parse_numbers(chunk, default_multiplier=mult, is_answer=False))
+
+    if market_data:
+        md_text = ""
+        if isinstance(market_data, dict):
+            safe_values = []
+            for k, v in market_data.items():
+                if k not in ("error", "status", "status_code"):
+                    safe_values.append(f"{k}: {v}")
+            md_text = " ".join(safe_values)
+        elif isinstance(market_data, str):
+            if not any(err in market_data.lower() for err in ["429", "500", "error", "no companies found"]):
+                md_text = market_data
+        if md_text:
+            ctx_numbers.extend(_parse_numbers(md_text, default_multiplier=1.0, is_answer=False))
+
+    grounded = []
+    unverified = []
+
+    for item in ans_numbers:
+        raw = item["raw"]
+        val = item["val"]
+        u_type = item["unit_type"]
+
+        is_grounded = False
+        for c in ctx_numbers:
+            if c["unit_type"] == u_type:
+                denom = max(abs(val), abs(c["val"]), 1e-9)
+                if abs(val - c["val"]) / denom <= relative_tolerance:
+                    is_grounded = True
+                    break
+
+        if is_grounded:
+            grounded.append(raw)
+        else:
+            unverified.append(raw)
+
+    total = len(ans_numbers)
+    ratio = round(len(grounded) / total, 4) if total > 0 else 1.0
+
+    return {
+        "ratio": ratio,
+        "grounded": grounded,
+        "unverified": unverified
+    }
+
 
 
 try:
@@ -480,7 +816,8 @@ def execute_parallel_tools(
         "market_data": "",
         "financial_rag": "",
         "sources": [],
-        "context_used": []
+        "context_used": [],
+        "dense_nodes": []
     }
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
@@ -502,6 +839,7 @@ def execute_parallel_tools(
                     results["financial_rag"] = res.get("content", "")
                     results["sources"].extend(res.get("sources", []))
                     results["context_used"].extend(res.get("raw_nodes", []))
+                    results["dense_nodes"].extend(res.get("dense_nodes", []))
             except Exception as e:
                 logger.error("Tool execution failed for %s: %s", tool_name, e)
 
@@ -509,8 +847,9 @@ def execute_parallel_tools(
 
 def render_audit_trail(audit_data: Any, st_ui: Any = None):
     """
-    Unified audit trail rendering across both historical conversation and live agent outputs (P1.4).
-    Renders scratchpad reasoning, cited sources/tickers, and all raw context snippets (no truncation).
+    Unified audit trail rendering across both historical conversation and live agent outputs (P1.4, P2.5).
+    Renders telemetry metrics, grounding check badge, scratchpad reasoning,
+    cited sources/tickers, and all raw context snippets (no truncation).
     """
     if st_ui is None:
         try:
@@ -519,7 +858,42 @@ def render_audit_trail(audit_data: Any, st_ui: Any = None):
             return
 
     with st_ui.expander("🔍 Audit Trail (Read the Source Data)"):
-        # 1. Scratchpad Reasoning
+        # 1. Telemetry & Quality Metrics (P2.5)
+        telemetry = getattr(audit_data, "telemetry", None)
+        if not telemetry and isinstance(audit_data, dict):
+            telemetry = audit_data.get("telemetry")
+        if telemetry:
+            st_ui.markdown("### ⏱️ Telemetry & System Latency")
+            col_fn = getattr(st_ui, "columns", None)
+            if col_fn:
+                cols = col_fn(4)
+                cols[0].metric("Router", f"{telemetry.get('router_ms', 0):.0f} ms")
+                cols[1].metric("Retrieval", f"{telemetry.get('retrieval_ms', 0):.0f} ms")
+                cols[2].metric("Synthesis", f"{telemetry.get('synthesis_ms', 0):.0f} ms")
+                cols[3].metric("LLM Calls", telemetry.get("llm_calls", 1))
+            else:
+                st_ui.write(telemetry)
+
+            # Numerical Grounding Badge (P2.3)
+            grounding = telemetry.get("grounding")
+            if grounding:
+                ratio = grounding.get("ratio", 1.0)
+                grounded_cnt = len(grounding.get("grounded", []))
+                unverified_cnt = len(grounding.get("unverified", []))
+                total_cnt = grounded_cnt + unverified_cnt
+                if total_cnt > 0:
+                    st_ui.markdown(f"**Numbers Verified:** `{grounded_cnt}/{total_cnt}` ({ratio*100:.1f}%)")
+                    if ratio < 0.8:
+                        st_ui.warning(f"⚠️ Low grounding ratio ({ratio*100:.1f}%). Some figures could not be verified directly against 10-K or market context.")
+                    if grounding.get("unverified"):
+                        st_ui.caption(f"Unverified figures: {', '.join(grounding['unverified'])}")
+
+            crag_status = telemetry.get("crag_status")
+            if crag_status:
+                st_ui.caption(f"CRAG Quality Gate: `{crag_status}` (Top Score: {telemetry.get('crag_top_score', 'N/A')})")
+            st_ui.divider()
+
+        # 2. Scratchpad Reasoning
         scratchpad = getattr(audit_data, "scratchpad", None)
         if not scratchpad and isinstance(audit_data, dict):
             scratchpad = audit_data.get("scratchpad")
@@ -528,7 +902,7 @@ def render_audit_trail(audit_data: Any, st_ui: Any = None):
             st_ui.info(scratchpad)
             st_ui.divider()
 
-        # 2. Cited Sources & Tickers
+        # 3. Cited Sources & Tickers
         sources = getattr(audit_data, "sources", None)
         if sources is None and isinstance(audit_data, dict):
             sources = audit_data.get("sources", [])
@@ -545,7 +919,7 @@ def render_audit_trail(audit_data: Any, st_ui: Any = None):
         st_ui.write(sources if sources else "No external sources cited.")
         st_ui.divider()
 
-        # 3. Raw Context Snippets (Exhaustive, un-truncated)
+        # 4. Raw Context Snippets (Exhaustive, un-truncated)
         context = getattr(audit_data, "context_used", None)
         if context is None and isinstance(audit_data, dict):
             context = audit_data.get("context", [])

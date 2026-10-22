@@ -1,11 +1,34 @@
 import streamlit as st
 import os
 import re
+import time
 import logging
 from pathlib import Path
 import pandas as pd
 from pydantic import BaseModel, Field
 from typing import List, Literal, Optional, Any
+
+from rag_guardrails import (
+    load_env,
+    check_query_budget,
+    check_prompt_injection,
+    resolve_tickers,
+    route_query,
+    build_synthesis_chat_template,
+    execute_parallel_tools,
+    get_market_data,
+    get_financial_rag,
+    assess_retrieval,
+    verify_numbers,
+    render_audit_trail,
+    CRAG_LOW_THRESHOLD,
+    FinalAnswer,
+    AgentResponse,
+)
+
+# Load local environment variables from .env if present
+load_env()
+
 from llama_index.core import VectorStoreIndex, Settings
 from llama_index.core.prompts import PromptTemplate
 from llama_index.core.llms import ChatMessage
@@ -13,19 +36,6 @@ from llama_index.vector_stores.pinecone import PineconeVectorStore
 from pinecone import Pinecone
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.llms.openai import OpenAI
-
-from rag_guardrails import (
-    check_query_budget,
-    resolve_tickers,
-    route_query,
-    build_synthesis_chat_template,
-    execute_parallel_tools,
-    get_market_data,
-    get_financial_rag,
-    render_audit_trail,
-    FinalAnswer,
-    AgentResponse,
-)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -86,49 +96,104 @@ class RoutePrediction(BaseModel):
     tools: List[Literal["financial_rag", "market_data", "general_chat"]] = Field(description="List of selected tools.")
 
 # --- 3. CACHED INITIALIZATION ---
+@st.cache_data(show_spinner=False)
+def load_nasdaq_data() -> pd.DataFrame:
+    """
+    Caches the NASDAQ symbols DataFrame using st.cache_data (Context7: serializable tabular data).
+    """
+    csv_path = Path(__file__).resolve().parent / "nasdaq-listed.csv"
+    if csv_path.exists():
+        df = pd.read_csv(csv_path)
+        df.columns = [c.strip() for c in df.columns]
+        return df
+    logger.warning("nasdaq-listed.csv not found at %s", csv_path)
+    return pd.DataFrame()
+
 @st.cache_resource(show_spinner=False)
-def initialize_resources():
+def initialize_pinecone_index():
+    """
+    Caches the Pinecone VectorStoreIndex connection using st.cache_resource (Context7: shared singleton).
+    """
     LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
     EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
     Settings.llm = OpenAI(model=LLM_MODEL, temperature=0, timeout=30.0, max_retries=2)
     Settings.embed_model = OpenAIEmbedding(model=EMBED_MODEL)
 
-    # Locate CSV directly anchored to app location
-    csv_path = Path(__file__).resolve().parent / "nasdaq-listed.csv"
-    if csv_path.exists():
-        nasdaq_df = pd.read_csv(csv_path)
-        nasdaq_df.columns = [c.strip() for c in nasdaq_df.columns]
-    else:
-        logger.warning("nasdaq-listed.csv not found at %s", csv_path)
-        nasdaq_df = pd.DataFrame()
-
-    # Connect to Pinecone
     try:
         api_key = os.environ.get("PINECONE_API_KEY")
         if not api_key:
             raise ValueError("Pinecone Key Missing")
         pc = Pinecone(api_key=api_key)
-        index = VectorStoreIndex.from_vector_store(
+        return VectorStoreIndex.from_vector_store(
             vector_store=PineconeVectorStore(pinecone_index=pc.Index("financial-rag-agent"))
         )
     except Exception as e:
         logger.warning("Pinecone vector store unavailable: %s", e)
-        index = None
-    
-    return nasdaq_df, index
+        return None
+
+def initialize_resources():
+    """Backward-compatible helper returning (nasdaq_df, pinecone_index)."""
+    return load_nasdaq_data(), initialize_pinecone_index()
+
+@st.cache_resource(show_spinner=False)
+def load_bm25_retrievers() -> dict:
+    """
+    Loads pre-exported 10-K document nodes from data/ and initializes BM25 retrievers (P2.1).
+    Enables sub-millisecond local hybrid search and offline resilience.
+    """
+    retrievers = {}
+    data_dir = Path(__file__).resolve().parent / "data"
+    for ticker in ["AAPL", "TSLA", "NVDA"]:
+        file_path = data_dir / f"nodes_{ticker}.json"
+        if file_path.exists():
+            try:
+                import json
+                from llama_index.core.schema import TextNode
+                from llama_index.retrievers.bm25 import BM25Retriever
+                with open(file_path, "r", encoding="utf-8") as f:
+                    node_dicts = json.load(f)
+                nodes = [TextNode.from_dict(d) for d in node_dicts]
+                retrievers[ticker] = BM25Retriever.from_defaults(nodes=nodes, similarity_top_k=8)
+            except Exception as e:
+                logger.warning("Failed to load BM25 retriever for %s: %s", ticker, e)
+    return retrievers
 
 # Silently load resources
-nasdaq_df, pinecone_index = initialize_resources()
+nasdaq_df = load_nasdaq_data()
+pinecone_index = initialize_pinecone_index()
+bm25_retrievers = load_bm25_retrievers()
 
 # --- 4. AGENT LOGIC ---
-def run_agent(user_query: str, index: Any, df: pd.DataFrame) -> AgentResponse:
+def run_agent(
+    user_query: str,
+    index: Any,
+    df: pd.DataFrame,
+    bm25_retrievers: Optional[dict] = None
+) -> AgentResponse:
     """
     Orchestrates the financial agent pipeline:
-    1. Rules-first router with LLM fallback (P1.2).
-    2. Deterministic ticker resolution once per query, never guessing (P1.1).
-    3. Concurrent execution of market_data and financial_rag (P1.3).
-    4. Single structured synthesis call using FinalAnswer (P1.4).
+    1. First-line prompt injection guard (P2.4).
+    2. Rules-first router with LLM fallback (P1.2).
+    3. Deterministic ticker resolution once per query, never guessing (P1.1).
+    4. Concurrent execution of market_data and financial_rag with hybrid BM25 (P1.3, P2.1).
+    5. CRAG confidence gate evaluating dense retrieval quality (P2.2).
+    6. Single structured synthesis call using FinalAnswer (P1.4).
+    7. Deterministic numerical grounding verification & telemetry (P2.3, P2.5).
     """
+    t_start = time.perf_counter()
+
+    # P2.4 Prompt-injection First-Line Guard
+    is_safe, injection_msg = check_prompt_injection(user_query)
+    if not is_safe:
+        return AgentResponse(
+            answer="Suspicious prompt injection detected. Your query was blocked by the security guardrail.",
+            sources=[],
+            context_used=[],
+            scratchpad="Security guardrail blocked adversarial prompt injection pattern.",
+            cited_tickers=[],
+            telemetry={"blocked": True, "llm_calls": 0}
+        )
+
     router_prompt = (
         "Route the user query to the correct tool based on these strict definitions:\n"
         "1. 'financial_rag': Company internal details (Revenue, Risks, Strategy, CEO).\n"
@@ -149,7 +214,9 @@ def run_agent(user_query: str, index: Any, df: pd.DataFrame) -> AgentResponse:
             logger.debug("Router LLM fallback failed: %s", e)
             return ["financial_rag"]
 
+    t_router_start = time.perf_counter()
     tools = route_query(user_query, llm_fallback=router_fallback)
+    t_router = time.perf_counter() - t_router_start
 
     if tools == ["general_chat"]:
         chat_response = Settings.llm.chat([
@@ -165,7 +232,13 @@ def run_agent(user_query: str, index: Any, df: pd.DataFrame) -> AgentResponse:
             context_used=[],
             scratchpad="General inquiry - retrieval skipped.",
             cited_tickers=[],
-            telemetry={"tools": tools, "llm_calls": 1}
+            telemetry={
+                "tools": tools,
+                "router_ms": round(t_router * 1000, 1),
+                "retrieval_ms": 0.0,
+                "synthesis_ms": round((time.perf_counter() - t_start - t_router) * 1000, 1),
+                "llm_calls": 1
+            }
         )
 
     def llm_ticker_fallback(q: str) -> List[str]:
@@ -189,19 +262,58 @@ def run_agent(user_query: str, index: Any, df: pd.DataFrame) -> AgentResponse:
             context_used=[],
             scratchpad="No verified company tickers identified in query.",
             cited_tickers=[],
-            telemetry={"tools": tools, "llm_calls": 0}
+            telemetry={
+                "tools": tools,
+                "router_ms": round(t_router * 1000, 1),
+                "retrieval_ms": 0.0,
+                "synthesis_ms": 0.0,
+                "llm_calls": 0
+            }
         )
 
     need_pe = bool(re.search(r"\b(pe|p/e|valuation|earnings)\b", user_query, re.IGNORECASE))
 
+    t_retrieval_start = time.perf_counter()
     tool_results = execute_parallel_tools(
         tools=tools,
         query=user_query,
         tickers=tickers,
         market_fn=lambda t, pe: get_market_data(t, need_pe=pe),
-        rag_fn=lambda q, t: get_financial_rag(q, t, index),
+        rag_fn=lambda q, t: get_financial_rag(q, t, index, bm25_retrievers=bm25_retrievers),
         need_pe=need_pe
     )
+    t_retrieval = time.perf_counter() - t_retrieval_start
+
+    # P2.2 CRAG Confidence Gate
+    dense_nodes = tool_results.get("dense_nodes", [])
+    crag_eval = assess_retrieval(user_query, dense_nodes)
+
+    has_market_data = bool(
+        tool_results.get("market_data") and
+        tool_results.get("market_data") != "No companies found." and
+        "unavailable" not in tool_results.get("market_data", "").lower()
+    )
+
+    if crag_eval["status"] == "INSUFFICIENT" and not has_market_data:
+        return AgentResponse(
+            answer="Data not available in the context.",
+            sources=[],
+            context_used=[],
+            scratchpad=f"CRAG gate INSUFFICIENT (top score {crag_eval['top_score']:.4f} < {CRAG_LOW_THRESHOLD}). Immediate refusal with 0 LLM calls.",
+            cited_tickers=[],
+            telemetry={
+                "tools": tools,
+                "tickers": tickers,
+                "router_ms": round(t_router * 1000, 1),
+                "retrieval_ms": round(t_retrieval * 1000, 1),
+                "synthesis_ms": 0.0,
+                "llm_calls": 0,
+                "crag_status": crag_eval["status"],
+                "crag_top_score": crag_eval["top_score"],
+                "grounding": {"ratio": 1.0, "grounded": [], "unverified": []},
+                "grounding_ratio": 1.0
+            }
+        )
 
     chat_tmpl = build_synthesis_chat_template(
         user_query=user_query,
@@ -209,10 +321,32 @@ def run_agent(user_query: str, index: Any, df: pd.DataFrame) -> AgentResponse:
         rag_content=tool_results.get("financial_rag", "")
     )
 
+    t_synth_start = time.perf_counter()
     final_answer = Settings.llm.structured_predict(
         FinalAnswer,
         chat_tmpl
     )
+    t_synth = time.perf_counter() - t_synth_start
+
+    # P2.3 Deterministic Numerical Grounding Check
+    grounding = verify_numbers(
+        answer=final_answer.answer,
+        chunks=tool_results.get("context_used", []),
+        market_data=tool_results.get("market_data", "")
+    )
+
+    telemetry = {
+        "tools": tools,
+        "tickers": tickers,
+        "router_ms": round(t_router * 1000, 1),
+        "retrieval_ms": round(t_retrieval * 1000, 1),
+        "synthesis_ms": round(t_synth * 1000, 1),
+        "llm_calls": 1,
+        "crag_status": crag_eval.get("status", "N/A"),
+        "crag_top_score": crag_eval.get("top_score", 0.0),
+        "grounding": grounding,
+        "grounding_ratio": grounding.get("ratio", 1.0)
+    }
 
     return AgentResponse(
         answer=final_answer.answer,
@@ -220,7 +354,7 @@ def run_agent(user_query: str, index: Any, df: pd.DataFrame) -> AgentResponse:
         context_used=tool_results.get("context_used", []),
         scratchpad=final_answer.scratchpad,
         cited_tickers=final_answer.cited_tickers,
-        telemetry={"tools": tools, "tickers": tickers, "llm_calls": 1}
+        telemetry=telemetry
     )
 
 # --- 5. UI LOGIC ---
@@ -283,7 +417,7 @@ if "query_count" not in st.session_state:
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
-        if message.get("sources") or message.get("context") or message.get("scratchpad"):
+        if message.get("sources") or message.get("context") or message.get("scratchpad") or message.get("telemetry"):
             render_audit_trail(message)
 
 # Handle Input (Button or Text)
@@ -304,7 +438,12 @@ if user_input := st.chat_input("Ask a financial question...") or prompt:
     with st.chat_message("assistant"):
         with st.status("🧠 Analyzing 10-Ks and Market Data...", expanded=True) as status:
             try:
-                response = run_agent(final_query, pinecone_index, nasdaq_df)
+                response = run_agent(
+                    final_query,
+                    pinecone_index,
+                    nasdaq_df,
+                    bm25_retrievers=bm25_retrievers
+                )
                 status.update(label="✅ Analysis Complete", state="complete", expanded=False)
             except Exception as e:
                 logger.error("Agent execution failed: %s", e)
@@ -324,4 +463,5 @@ if user_input := st.chat_input("Ask a financial question...") or prompt:
             "context": response.context_used,
             "scratchpad": response.scratchpad,
             "cited_tickers": response.cited_tickers,
+            "telemetry": response.telemetry,
         })

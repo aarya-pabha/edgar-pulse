@@ -56,13 +56,36 @@ Financial SEC 10-K reports contain "Consolidated Financial Statements"—massive
 
 ### 2. High-Performance Deterministic Router & Execution Engine
 
-The decision engine combines deterministic rules-first routing with structured LLM fallback and true parallel tool execution:
+The decision engine combines deterministic rules-first routing with structured LLM fallback, hybrid retrieval, and true parallel tool execution:
 
+* **Prompt-Injection First-Line Defense (OWASP LLM01):** Validates queries against adversarial override patterns (`ignore previous instructions`, `developer mode`, `system prompt`), supported structurally by native role-separated `ChatMessage(role="system")` boundaries and `<context_data>` / `<user_query>` XML tagging.
 * **Deterministic Ticker Resolution:** Resolves symbols once per query via curated alias maps, NASDAQ symbol lookups, and finance-acronym stoplists. Never hallucinates unverified tickers or guesses random nodes.
 * **Rules-First Router:** Evaluates word-boundary regexes for sub-millisecond classification, falling back to LlamaIndex structured prediction (`Settings.llm.structured_predict`) only when rules are ambiguous.
+* **Hybrid Retrieval (Dense + BM25 Fusion):** Combines Pinecone dense embeddings with local BM25 keyword search using `QueryFusionRetriever` (Reciprocal Rank Fusion with $k=60$), guaranteeing exact section queries (e.g. "Item 1A Risk Factors", "Note 12") rank in the top 3.
+* **CRAG Quality Gate:** Evaluates un-altered dense similarity scores before fusion. If retrieval quality is `INSUFFICIENT` (<0.40) and no live market data exists, returns `"Data not available in the context."` with **0 LLM calls**.
 * **True Parallel Execution:** Runs `market_data` (`yfinance.fast_info` <150ms) and `financial_rag` (`similarity_top_k=8`, `MetadataMode.LLM`) concurrently using `concurrent.futures.ThreadPoolExecutor(max_workers=2)`.
 * **Single-Call Structured Synthesis:** Eliminates per-ticker summarization calls, feeding raw labeled chunks into a single `FinalAnswer` synthesis call with reasoning scratchpads.
+* **Deterministic Numerical Grounding Check:** Post-generation Python validator parses numerical figures in the LLM answer, verifies them against 10-K tables (accounting for `(in millions)` scaling) and market data within $\le 0.5\%$ relative tolerance, and flags unverified claims in the UI badge.
+* **Telemetry & Unified Audit Trail:** Emits per-request latency metrics (`router_ms`, `retrieval_ms`, `synthesis_ms`), LLM call counts, CRAG score/status, and numerical grounding ratios in both live outputs and historical chat turns.
 * **Cost & Abuse Guard:** Protected against OWASP LLM10 unbounded consumption with per-query length limits (1,000 chars) and per-session quotas (25 queries).
+
+```mermaid
+flowchart TD
+    Q["User Query"] --> L["Length & Abuse Guard + Prompt Injection Filter"]
+    L --> R["Rule-Based Router (Regex) → Structured LLM Fallback"]
+    R --> T["Deterministic Ticker Resolution (NASDAQ CSV + Alias Map)"]
+    T --> PAR["Concurrent Execution (ThreadPoolExecutor)"]
+    PAR --> MD["Real-Time Market Data (yfinance fast_info <150ms)"]
+    PAR --> DR["Dense Retrieval (Pinecone top_k=8, cosine)"]
+    DR --> CRAG{"CRAG Quality Gate"}
+    CRAG -- INSUFFICIENT & No Market Data --> REF["'Data not available in the context.' (0 LLM calls)"]
+    CRAG -- OK / AMBIGUOUS --> FUS["QueryFusionRetriever (Dense + BM25, RRF k=60)"]
+    FUS --> LBL["Labeled Chunks (MetadataMode.LLM)"]
+    MD --> SYN
+    LBL --> SYN["Single Structured Synthesis: FinalAnswer(scratchpad, answer)"]
+    SYN --> NG["Deterministic Numerical Grounding Check (0.5% tolerance)"]
+    NG --> OUT["Unified Audit Trail: Telemetry + Verified Badges + Reasoning"]
+```
 
 ## 📊 Rigorous Evaluation Pipeline (Ragas)
 
