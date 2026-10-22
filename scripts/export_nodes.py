@@ -9,7 +9,8 @@ import logging
 from pathlib import Path
 
 # Add project root to sys.path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from pinecone import Pinecone
 from llama_index.core.vector_stores.utils import metadata_dict_to_node
@@ -31,6 +32,8 @@ def export_all_nodes(output_dir: str = "data"):
     idx = pc.Index(index_name)
 
     out_path = Path(output_dir)
+    if not out_path.is_absolute():
+        out_path = PROJECT_ROOT / out_path
     out_path.mkdir(parents=True, exist_ok=True)
 
     logger.info("Listing all vector IDs in index '%s'...", index_name)

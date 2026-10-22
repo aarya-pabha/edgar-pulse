@@ -1,13 +1,40 @@
-# Security
-.env
+# Security & Environment
+.env*
 .streamlit/secrets.toml
 
+# Internal Specs, Notes & Architecture Diagrams
+UPGRADE_SPEC*.md
+*_SPEC_*.md
 .archify/
-# Python Caches
+
+# Generated Evaluation Run Outputs (Keep static benchmarks: phase3_validation_set.csv & phase3_ragas_scores_*.csv)
+evaluation/eval_results_*.csv
+
+# Python Caches & Build Artifacts
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+*.egg-info/
+dist/
+build/
+
+# Test & Coverage Caches
+.pytest_cache/
+.coverage
+htmlcov/
+.gemini_security/
 
 # Virtual Environments
 venv/
+.venv/
 env/
+
+# Editor & IDE Settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS Metadata
+.DS_Store
+Thumbs.db

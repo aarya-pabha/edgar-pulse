@@ -1,5 +1,5 @@
 """
-Unit tests for Phase 3 Evaluation Harness (eval/run_eval.py).
+Unit tests for Phase 3 Evaluation Harness (evaluation/run_eval.py).
 Tests strict refusal contracts, NaN tracking, aggregation logic,
 and mock headless execution with zero API keys.
 """
@@ -7,7 +7,7 @@ and mock headless execution with zero API keys.
 import pytest
 import pandas as pd
 from pathlib import Path
-from eval.run_eval import compute_refusal_metrics, summarize_evaluation, run_evaluation
+from evaluation.run_eval import compute_refusal_metrics, summarize_evaluation, run_evaluation
 from rag_guardrails import AgentResponse
 
 def test_compute_refusal_metrics():

@@ -10,7 +10,8 @@ import sys
 from pathlib import Path
 
 # Add project root to sys.path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 import pandas as pd
 from pinecone import Pinecone
@@ -35,13 +36,13 @@ def calibrate():
         vector_store=PineconeVectorStore(pinecone_index=pc.Index("financial-rag-agent"))
     )
 
-    df_path = Path("evaluation/phase3_validation_set.csv")
+    df_path = PROJECT_ROOT / "evaluation" / "phase3_validation_set.csv"
     if not df_path.exists():
         print(f"Validation set not found at {df_path}")
         return
 
     val_df = pd.read_csv(df_path)
-    csv_path = Path("nasdaq-listed.csv")
+    csv_path = PROJECT_ROOT / "nasdaq-listed.csv"
     nasdaq_df = pd.read_csv(csv_path) if csv_path.exists() else pd.DataFrame()
 
     results = []

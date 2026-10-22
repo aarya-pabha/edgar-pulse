@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 import pandas as pd
 from pydantic import BaseModel, Field
-from typing import List, Literal, Optional, Any
+from typing import List, Literal, Optional, Any, Callable
 
 from rag_guardrails import (
     load_env,
@@ -169,7 +169,8 @@ def run_agent(
     user_query: str,
     index: Any,
     df: pd.DataFrame,
-    bm25_retrievers: Optional[dict] = None
+    bm25_retrievers: Optional[dict] = None,
+    status_cb: Optional[Callable[[str], None]] = None
 ) -> AgentResponse:
     """
     Orchestrates the financial agent pipeline:
@@ -218,8 +219,12 @@ def run_agent(
     t_router_start = time.perf_counter()
     tools = route_query(user_query, llm_fallback=router_fallback)
     t_router = time.perf_counter() - t_router_start
+    if status_cb:
+        status_cb(f"⚡ Routed tools: `{', '.join(tools)}`")
 
     if tools == ["general_chat"]:
+        if status_cb:
+            status_cb("💬 Generating direct conversational response...")
         chat_response = Settings.llm.chat([
             ChatMessage(
                 role="system",
@@ -255,6 +260,8 @@ def run_agent(
             return []
 
     tickers = resolve_tickers(user_query, df, llm_fallback=llm_ticker_fallback)
+    if status_cb and tickers:
+        status_cb(f"🎯 Target companies: `{', '.join(tickers)}`")
 
     if not tickers:
         return AgentResponse(
@@ -274,6 +281,8 @@ def run_agent(
 
     need_pe = bool(re.search(r"\b(pe|p/e|valuation|earnings)\b", user_query, re.IGNORECASE))
 
+    if status_cb:
+        status_cb("📥 Fetching 10-K filings and real-time market data concurrently...")
     t_retrieval_start = time.perf_counter()
     tool_results = execute_parallel_tools(
         tools=tools,
@@ -296,6 +305,8 @@ def run_agent(
     )
 
     if crag_eval["status"] == "INSUFFICIENT" and not has_market_data:
+        if status_cb:
+            status_cb("🛑 CRAG quality gate flagged insufficient context. Immediate honest refusal.")
         return AgentResponse(
             answer="Data not available in the context.",
             sources=[],
@@ -322,6 +333,8 @@ def run_agent(
         rag_content=tool_results.get("financial_rag", "")
     )
 
+    if status_cb:
+        status_cb("🧠 Synthesizing structured financial analysis...")
     t_synth_start = time.perf_counter()
     final_answer = Settings.llm.structured_predict(
         FinalAnswer,
@@ -330,6 +343,8 @@ def run_agent(
     t_synth = time.perf_counter() - t_synth_start
 
     # P2.3 Deterministic Numerical Grounding Check
+    if status_cb:
+        status_cb("🔍 Validating numerical figures against context tables...")
     grounding = verify_numbers(
         answer=final_answer.answer,
         chunks=tool_results.get("context_used", []),
@@ -343,6 +358,8 @@ def run_agent(
         "retrieval_ms": round(t_retrieval * 1000, 1),
         "synthesis_ms": round(t_synth * 1000, 1),
         "llm_calls": 1,
+        "rag_skipped": "financial_rag" not in tools,
+        "prompt_cache_eligible": len(tool_results.get("financial_rag", "")) > 1000,
         "crag_status": crag_eval.get("status", "N/A"),
         "crag_top_score": crag_eval.get("top_score", 0.0),
         "grounding": grounding,
@@ -437,13 +454,14 @@ if user_input := st.chat_input("Ask a financial question...") or prompt:
         st.markdown(final_query)
 
     with st.chat_message("assistant"):
-        with st.status("🧠 Analyzing 10-Ks and Market Data...", expanded=True) as status:
+        with st.status("🧠 Processing Financial Query...", expanded=True) as status:
             try:
                 response = run_agent(
                     final_query,
                     pinecone_index,
                     nasdaq_df,
-                    bm25_retrievers=bm25_retrievers
+                    bm25_retrievers=bm25_retrievers,
+                    status_cb=lambda msg: status.write(msg)
                 )
                 status.update(label="✅ Analysis Complete", state="complete", expanded=False)
             except Exception as e:
