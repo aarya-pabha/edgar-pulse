@@ -23,5 +23,29 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
+          # Dynamically prepend HF frontmatter so GitHub README stays clean with no metadata box
+          cat << 'EOF' > /tmp/hf_frontmatter.txt
+          ---
+          title: EDGAR Pulse
+          emoji: ⚡
+          colorFrom: gray
+          colorTo: indigo
+          sdk: docker
+          app_port: 8501
+          tags:
+            - streamlit
+            - financial-ai
+            - agentic-rag
+          pinned: false
+          short_description: SEC Form 10-K & Real-Time Market Terminal
+          license: mit
+          ---
+
+          EOF
+          cat /tmp/hf_frontmatter.txt README.md > /tmp/README_HF.md
+          mv /tmp/README_HF.md README.md
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -am "ci(hf): inject HF frontmatter for deployment" || true
           git push --force https://Aarya003:$HF_TOKEN@huggingface.co/spaces/Aarya003/Financial-Analyst-Agent main
 

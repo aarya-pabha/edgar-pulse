@@ -1,19 +1,3 @@
----
-title: EDGAR Pulse
-emoji: ⚡
-colorFrom: gray
-colorTo: indigo
-sdk: docker
-app_port: 8501
-tags:
-  - streamlit
-  - financial-ai
-  - agentic-rag
-pinned: false
-short_description: SEC Form 10-K & Real-Time Market Terminal
-license: mit
----
-
 # EDGAR Pulse: SEC Form 10-K & Real-Time Market Intelligence Terminal
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-0f172a?style=flat-square&logo=python&logoColor=3776AB)](https://www.python.org/)
