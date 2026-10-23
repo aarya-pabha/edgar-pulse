@@ -192,7 +192,7 @@ EDGAR Pulse enforces a 3-tier verification pipeline to ensure zero regressions a
 ## 📂 Repository Structure
 
 ```text
-financial-ai-agent/
+edgar-pulse/
 │
 ├── .streamlit/                                # Institutional dark UI theme configuration
 │   └── config.toml                            # Obsidian palette, font stack, and client settings
@@ -239,8 +239,8 @@ financial-ai-agent/
 
 ### 1. Clone & Configure Environment
 ```bash
-git clone https://github.com/aarya-pabha/financial-ai-agent.git
-cd financial-ai-agent
+git clone https://github.com/aarya-pabha/edgar-pulse.git
+cd edgar-pulse
 
 # Create your local .env from the provided template
 cp .env.example .env
