@@ -1,5 +1,6 @@
 # Security & Environment
 .env*
+!.env.example
 .streamlit/secrets.toml
 
 # Internal Specs, Notes & Architecture Diagrams
@@ -23,6 +24,8 @@ build/
 .coverage
 htmlcov/
 .gemini_security/
+test-results/
+playwright-report/
 
 # Virtual Environments
 venv/
