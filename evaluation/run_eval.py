@@ -181,7 +181,7 @@ def run_evaluation(
     return results_df, summary
 
 def main():
-    parser = argparse.ArgumentParser(description="Wall St. AI Analyst Evaluation Harness (P3.1)")
+    parser = argparse.ArgumentParser(description="EDGAR Pulse Evaluation Harness (P3.1)")
     parser.add_argument("--csv", type=str, default=None, help="Path to input validation CSV")
     parser.add_argument("--output", type=str, default=None, help="Path to output results CSV")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of queries to evaluate")
@@ -195,7 +195,7 @@ def main():
     model_used = os.getenv("LLM_MODEL", "gpt-6-luna")
     mode_label = "MOCK DRY-RUN (0 API calls, $0)" if args.mock else "LIVE RUN"
     print(f"\n========================================================")
-    print(f" Wall St. AI Analyst - Evaluation Harness (P3)")
+    print(f" EDGAR Pulse - Evaluation Harness (P3)")
     print(f" Target Model : {model_used}")
     print(f" Execution Mode: {mode_label}")
     print(f"========================================================\n")

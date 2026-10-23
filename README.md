@@ -1,4 +1,4 @@
-# 🏛️ Wall St. AI Analyst: Hybrid RAG & Live Market Data Agent
+# EDGAR Pulse: SEC Form 10-K & Real-Time Market Intelligence Terminal
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-0f172a?style=flat-square&logo=python&logoColor=3776AB)](https://www.python.org/)
 [![LlamaIndex](https://img.shields.io/badge/LlamaIndex-0.10+-0f172a?style=flat-square&logo=llamaindex&logoColor=white)](https://www.llamaindex.ai/)
@@ -9,15 +9,15 @@
 [![Hugging Face](https://img.shields.io/badge/Hugging_Face-Live_Space-0f172a?style=flat-square&logo=huggingface&logoColor=FFD21E)](https://huggingface.co/spaces/Aarya003/Financial-Analyst-Agent)
 [![License: MIT](https://img.shields.io/badge/License-MIT-0f172a?style=flat-square&logo=open-source-initiative&logoColor=white)](LICENSE)
 
-## 🚀 Live Interactive Demo
-**Interact with the deployed agent here:** [Wall St. AI Analyst on Hugging Face Spaces](https://huggingface.co/spaces/Aarya003/Financial-Analyst-Agent)
+## Live Interactive Terminal
+**Interact with the deployed terminal here:** [EDGAR Pulse on Hugging Face Spaces](https://huggingface.co/spaces/Aarya003/Financial-Analyst-Agent)
 
 > **Note on Cold Starts:** Free-tier Hugging Face Spaces spin down into a sleep state after a period of inactivity. If the app is sleeping, waking the container takes approximately 30–60 seconds on first launch.
 
-## 📌 Project Overview
+## Project Overview
 Standard Retrieval-Augmented Generation (RAG) applications fail in the financial sector because they attempt to extract highly volatile, real-time numbers (like stock prices or PE ratios) from static, outdated PDF documents. 
 
-The **Wall St. AI Analyst** solves this by implementing a **Semantic Routing Architecture**. It dynamically intercepts user queries and routes them to the appropriate specialized tool: a Vector Database for deep, qualitative 10-K analysis, or a live financial API for quantitative, real-time trading metrics.
+**EDGAR Pulse** solves this by implementing a **Semantic Routing Architecture**. It dynamically intercepts user queries and routes them to the appropriate specialized tool: a Vector Database for deep, qualitative 10-K analysis, or a live financial API for quantitative, real-time trading metrics.
 
 ## 📂 Repository Structure
 ```text

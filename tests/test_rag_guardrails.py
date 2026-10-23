@@ -490,10 +490,11 @@ def test_render_audit_trail_agent_response():
 
     render_audit_trail(resp, st_ui=mock_st)
 
-    mock_st.expander.assert_called_once_with("🔍 Audit Trail (Read the Source Data)")
+    mock_st.expander.assert_called_once_with("Audit Trail (Read the Source Data)")
     mock_st.info.assert_called_once_with("Apple figures: $383B revenue.")
-    mock_st.write.assert_called_once_with(["Apple 10-K"])
-    mock_st.text.assert_called_once_with("Apple 2023 revenue reached $383 billion.")
+    markdown_calls = [c.args[0] for c in mock_st.markdown.call_args_list if c.args]
+    assert any("Apple 10-K" in m for m in markdown_calls)
+    assert any("Apple 2023 revenue reached $383 billion." in m for m in markdown_calls)
 
 def test_render_audit_trail_dict_message():
     from rag_guardrails import render_audit_trail
@@ -510,10 +511,12 @@ def test_render_audit_trail_dict_message():
 
     render_audit_trail(msg, st_ui=mock_st)
 
-    mock_st.expander.assert_called_once_with("🔍 Audit Trail (Read the Source Data)")
+    mock_st.expander.assert_called_once_with("Audit Trail (Read the Source Data)")
     mock_st.info.assert_called_once_with("Tesla figures: $82B auto, $6B energy.")
-    mock_st.write.assert_called_once_with(["Tesla 10-K"])
-    assert mock_st.text.call_count == 2
+    markdown_calls = [c.args[0] for c in mock_st.markdown.call_args_list if c.args]
+    assert any("Tesla 10-K" in m for m in markdown_calls)
+    assert any("Automotive revenues were $82B." in m for m in markdown_calls)
+    assert any("Energy revenues were $6B." in m for m in markdown_calls)
 
 # --- Tests for P2.4 Prompt Injection First Line Guard ---
 
@@ -653,7 +656,7 @@ def test_render_audit_trail_with_telemetry_and_grounding():
 
     render_audit_trail(resp, st_ui=mock_st)
 
-    mock_st.expander.assert_called_once_with("🔍 Audit Trail (Read the Source Data)")
+    mock_st.expander.assert_called_once_with("Audit Trail (Read the Source Data)")
     mock_st.columns.assert_called_once_with(4)
     mock_cols[0].metric.assert_called_once_with("Router", "15 ms")
     mock_cols[1].metric.assert_called_once_with("Retrieval", "140 ms")
@@ -738,6 +741,57 @@ def test_run_agent_with_status_cb():
     )
     # Injection blocked immediately
     assert res.telemetry["blocked"] is True
+
+def test_run_agent_status_phases_progression():
+    from app import run_agent
+    from unittest.mock import patch, MagicMock
+    from llama_index.core import Settings
+    from rag_guardrails import FinalAnswer
+
+    mock_df = pd.DataFrame({"Symbol": ["AAPL"], "Security Name": ["Apple Inc."]})
+    status_updates = []
+
+    mock_node = MagicMock()
+    mock_node.score = 0.85
+    mock_node.node.get_content.return_value = "Apple FY23 revenue was $383.29B."
+
+    with patch("app.execute_parallel_tools") as mock_exec, \
+         patch.object(type(Settings.llm), "structured_predict") as mock_pred:
+        mock_exec.return_value = {
+            "financial_rag": "Apple revenue was $383.29B.",
+            "dense_nodes": [mock_node],
+            "context_used": ["Apple revenue was $383.29B."],
+            "sources": ["10-K Apple Inc. FY23"]
+        }
+        mock_pred.return_value = FinalAnswer(
+            scratchpad="Apple revenue was $383.29B.",
+            answer="Apple's revenue was $383.29B.",
+            cited_tickers=["AAPL"]
+        )
+
+        res = run_agent(
+            "What was Apple's FY23 revenue in the 10-K?",
+            index=None,
+            df=mock_df,
+            status_cb=lambda msg: status_updates.append(msg)
+        )
+
+    # 1. Verify Phase 1/4 is called exactly once (no duplicate Phase 1/4)
+    p1 = [s for s in status_updates if "Phase 1/4" in s]
+    assert len(p1) == 1, f"Expected exactly 1 Phase 1/4 message, got: {p1}"
+
+    # 2. Verify Phase 2/4 is present
+    p2 = [s for s in status_updates if "Phase 2/4" in s]
+    assert len(p2) == 1, f"Expected exactly 1 Phase 2/4 message, got: {p2}"
+
+    # 3. Verify Phase 3/4 is present (never skipped when retrieval passes)
+    p3 = [s for s in status_updates if "Phase 3/4" in s]
+    assert len(p3) == 1, f"Expected exactly 1 Phase 3/4 message, got: {p3}"
+    assert "Context quality verified" in p3[0]
+
+    # 4. Verify Phase 4/4 is present for synthesis & verification
+    p4 = [s for s in status_updates if "Phase 4/4" in s]
+    assert len(p4) >= 1, f"Expected at least 1 Phase 4/4 message, got: {p4}"
 
 def test_load_env_parsing(tmp_path):
     from rag_guardrails import load_env

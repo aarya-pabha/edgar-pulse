@@ -5,6 +5,7 @@ deterministic ticker resolution, and rules-first semantic routing.
 """
 import os
 import re
+import html
 import logging
 import concurrent.futures
 from pathlib import Path
@@ -682,6 +683,11 @@ def _parse_numbers(text: str, default_multiplier: float = 1.0, is_answer: bool =
         if prefix:
             continue
 
+        # Prevent SEC Form references like 10-K or 10-Q from parsing as standalone numbers
+        end_pos = match.end()
+        if end_pos < len(text) and text[end_pos:end_pos+2].upper() in ("-K", "-Q"):
+            continue
+
         try:
             clean_num = float(num_str.replace(",", ""))
         except ValueError:
@@ -691,6 +697,9 @@ def _parse_numbers(text: str, default_multiplier: float = 1.0, is_answer: bool =
             if 1900 <= clean_num <= 2100 and clean_num.is_integer():
                 continue
             if is_answer and clean_num < 10 and clean_num.is_integer():
+                continue
+            # Ignore small bare integers under 100 that lack financial units (e.g. Note 12, Item 7, 10-K)
+            if is_answer and clean_num < 100 and clean_num.is_integer():
                 continue
 
         unit_type = "scalar"
@@ -818,9 +827,9 @@ def build_synthesis_messages(
     sanitized_query = (user_query or "").replace("</user_query>", "&lt;/user_query&gt;")
 
     system_instruction = (
-        "You are a Wall Street Financial Analyst.\n"
+        "You are EDGAR Pulse, an audited SEC Form 10-K & Real-Time Market Intelligence Terminal.\n"
         "Instructions:\n"
-        "1. Compare metrics if multiple companies are listed.\n"
+        "1. If multiple companies are queried, synthesize key qualitative and quantitative metrics into a clear Markdown comparison table.\n"
         "2. Synthesize qualitative (Risks) and quantitative (Price) data.\n"
         "3. Cite sources.\n"
         "4. If the requested information is absent from the provided context, state: 'Data not available in the context.'\n"
@@ -938,8 +947,8 @@ def execute_parallel_tools(
 def render_audit_trail(audit_data: Any, st_ui: Any = None):
     """
     Unified audit trail rendering across both historical conversation and live agent outputs (P1.4, P2.5).
-    Renders telemetry metrics, grounding check badge, scratchpad reasoning,
-    cited sources/tickers, and all raw context snippets (no truncation).
+    Renders provenance verification bar, telemetry metrics, grounding check badge, scratchpad reasoning,
+    cited sources/tickers, and all raw context snippets (no truncation, styled without horizontal overflow).
     """
     if st_ui is None:
         try:
@@ -947,13 +956,73 @@ def render_audit_trail(audit_data: Any, st_ui: Any = None):
         except ImportError:
             return
 
-    with st_ui.expander("🔍 Audit Trail (Read the Source Data)"):
-        # 1. Telemetry & Quality Metrics (P2.5)
-        telemetry = getattr(audit_data, "telemetry", None)
-        if not telemetry and isinstance(audit_data, dict):
-            telemetry = audit_data.get("telemetry")
+    # Extract fields
+    telemetry = getattr(audit_data, "telemetry", None)
+    if not telemetry and isinstance(audit_data, dict):
+        telemetry = audit_data.get("telemetry")
+
+    sources = getattr(audit_data, "sources", None)
+    if sources is None and isinstance(audit_data, dict):
+        sources = audit_data.get("sources", [])
+    sources = sources or []
+
+    cited_tickers = getattr(audit_data, "cited_tickers", None)
+    if cited_tickers is None and isinstance(audit_data, dict):
+        cited_tickers = audit_data.get("cited_tickers", [])
+    cited_tickers = cited_tickers or []
+
+    context = getattr(audit_data, "context_used", None)
+    if context is None and isinstance(audit_data, dict):
+        context = audit_data.get("context", [])
+    context = context or []
+
+    scratchpad = getattr(audit_data, "scratchpad", None)
+    if not scratchpad and isinstance(audit_data, dict):
+        scratchpad = audit_data.get("scratchpad")
+
+    # Item 32: Inline At-a-Glance Provenance Strip
+    grounding = (telemetry or {}).get("grounding") or {}
+    ratio = (telemetry or {}).get("grounding_ratio", grounding.get("ratio", 1.0))
+    grounded_cnt = len(grounding.get("grounded", []))
+    unverified_cnt = len(grounding.get("unverified", []))
+    total_cnt = grounded_cnt + unverified_cnt
+
+    total_latency_ms = 0.0
+    if telemetry:
+        total_latency_ms = telemetry.get("router_ms", 0.0) + telemetry.get("retrieval_ms", 0.0) + telemetry.get("synthesis_ms", 0.0)
+
+    if ratio >= 0.8:
+        status_bg = "rgba(68, 162, 130, 0.12)"
+        status_border = "rgba(68, 162, 130, 0.3)"
+        status_color = "#44a282"
+        status_label = f"VERIFIED {grounded_cnt}/{total_cnt}" if total_cnt > 0 else "VERIFIED 100%"
+    else:
+        status_bg = "rgba(229, 86, 111, 0.12)"
+        status_border = "rgba(229, 86, 111, 0.3)"
+        status_color = "#e5566f"
+        status_label = f"LOW GROUNDING {grounded_cnt}/{total_cnt}"
+
+    ticker_badges = "".join([f'<span style="background: #1c1b20; border: 1px solid #2b2b30; color: #ededed; padding: 2px 6px; border-radius: 4px; font-size: 0.68rem; margin-right: 4px;">{html.escape(str(t))}</span>' for t in cited_tickers])
+
+    provenance_bar_html = f"""
+    <div style="background: #131217; border: 1px solid #2b2b30; border-radius: 6px; padding: 6px 12px; margin-top: 6px; margin-bottom: 8px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; font-family: 'Geist Mono', monospace; font-size: 0.72rem;">
+        <div style="display: flex; align-items: center; gap: 8px;">
+            <span style="background: {status_bg}; border: 1px solid {status_border}; color: {status_color}; padding: 2px 8px; border-radius: 4px; font-weight: 600;">{status_label}</span>
+            <div>{ticker_badges}</div>
+        </div>
+        <div style="color: #88888e; font-variant-numeric: tabular-nums;">
+            <span>Latency: <strong style="color: #ededed;">{total_latency_ms:.0f} ms</strong></span>
+            <span style="margin: 0 6px;">·</span>
+            <span>Sources: <strong style="color: #ededed;">{len(sources)}</strong></span>
+        </div>
+    </div>
+    """
+    st_ui.markdown(provenance_bar_html, unsafe_allow_html=True)
+
+    with st_ui.expander("Audit Trail (Read the Source Data)"):
+        # 1. Telemetry & Quality Metrics (P2.5, Item 36)
         if telemetry:
-            st_ui.markdown("### ⏱️ Telemetry & System Latency")
+            st_ui.markdown("**Pipeline Latency & Grounding**")
             col_fn = getattr(st_ui, "columns", None)
             if col_fn:
                 cols = col_fn(4)
@@ -965,66 +1034,80 @@ def render_audit_trail(audit_data: Any, st_ui: Any = None):
                 st_ui.write(telemetry)
 
             # Numerical Grounding Badge (P2.3)
-            grounding = telemetry.get("grounding")
             if grounding:
-                ratio = grounding.get("ratio", 1.0)
-                grounded_cnt = len(grounding.get("grounded", []))
-                unverified_cnt = len(grounding.get("unverified", []))
-                total_cnt = grounded_cnt + unverified_cnt
                 if total_cnt > 0:
                     st_ui.markdown(f"**Numbers Verified:** `{grounded_cnt}/{total_cnt}` ({ratio*100:.1f}%)")
                     if ratio < 0.8:
-                        st_ui.warning(f"⚠️ Low grounding ratio ({ratio*100:.1f}%). Some figures could not be verified directly against 10-K or market context.")
+                        st_ui.warning(f"Grounding Notice: Low grounding ratio ({ratio*100:.1f}%). Some figures could not be verified directly against 10-K or market context.")
                     if grounding.get("unverified"):
                         st_ui.caption(f"Unverified figures: {', '.join(grounding['unverified'])}")
 
             crag_status = telemetry.get("crag_status")
             if crag_status:
-                st_ui.caption(f"CRAG Quality Gate: `{crag_status}` (Top Score: {telemetry.get('crag_top_score', 'N/A')})")
+                st_ui.caption(f"CRAG Gate: Status `{crag_status}` (Top Score: {telemetry.get('crag_top_score', 'N/A')})")
 
             if telemetry.get("rag_skipped"):
-                st_ui.caption("⚡ **Fast-Path Market Data:** 10-K RAG bypassed (0 Pinecone calls)")
+                st_ui.caption("Fast-Path Market Data: 10-K RAG bypassed (0 Pinecone calls)")
             elif telemetry.get("prompt_cache_eligible"):
-                st_ui.caption("💾 **Prefix Cache Active:** Static prompt & 10-K context prefix ≥ 1,024 tokens (OpenAI automatic cache active)")
+                st_ui.caption("Prefix Cache Active: Static prompt & 10-K context prefix ≥ 1,024 tokens (OpenAI automatic cache active)")
             st_ui.divider()
 
         # 2. Scratchpad Reasoning
-        scratchpad = getattr(audit_data, "scratchpad", None)
-        if not scratchpad and isinstance(audit_data, dict):
-            scratchpad = audit_data.get("scratchpad")
         if scratchpad:
-            st_ui.markdown("### 🧠 Scratchpad Reasoning")
+            st_ui.markdown("**Synthesis Reasoning Scratchpad**")
             st_ui.info(scratchpad)
             st_ui.divider()
 
-        # 3. Cited Sources & Tickers
-        sources = getattr(audit_data, "sources", None)
-        if sources is None and isinstance(audit_data, dict):
-            sources = audit_data.get("sources", [])
-        sources = sources or []
-
-        cited_tickers = getattr(audit_data, "cited_tickers", None)
-        if cited_tickers is None and isinstance(audit_data, dict):
-            cited_tickers = audit_data.get("cited_tickers", [])
-        cited_tickers = cited_tickers or []
-
-        st_ui.markdown("### 📚 Cited Sources & Tickers")
+        # 3. Cited Sources & Tickers (Item 33)
+        st_ui.markdown("**Audited Documents & Equities**")
         if cited_tickers:
-            st_ui.markdown(f"**Cited Tickers:** {', '.join(cited_tickers)}")
-        st_ui.write(sources if sources else "No external sources cited.")
+            st_ui.markdown(f"**Cited Equities:** {', '.join(cited_tickers)}")
+        if sources:
+            source_chips = " ".join([f"`[{s}]`" for s in sources])
+            st_ui.markdown(f"**Audited Sources:** {source_chips}")
+        else:
+            st_ui.markdown("*No external sources cited.*")
         st_ui.divider()
 
-        # 4. Raw Context Snippets (Exhaustive, un-truncated)
-        context = getattr(audit_data, "context_used", None)
-        if context is None and isinstance(audit_data, dict):
-            context = audit_data.get("context", [])
-        context = context or []
-
-        st_ui.markdown("### 📄 Raw Context Snippets")
+        # 4. Raw Context Snippets (Exhaustive, un-truncated, styled markdown) (Items 34, 35, 37, 38)
+        st_ui.markdown("**SEC Context Evidence & Passages**")
         if context:
+            filter_kw = ""
+            if hasattr(st_ui, "text_input") and len(context) > 1:
+                try:
+                    ans_txt = getattr(audit_data, "answer", None) or (audit_data.get("content") if isinstance(audit_data, dict) else "")
+                    seed_str = f"{len(context)}_{''.join(sources)}_{str(ans_txt)[:25]}"
+                    stable_key = f"filter_ctx_{abs(hash(seed_str)) % 1000000}"
+                    val = st_ui.text_input(
+                        "Filter context passages:",
+                        placeholder="Search by keyword (e.g. supply chain, Note 12, revenue)...",
+                        key=stable_key
+                    )
+                    if isinstance(val, str):
+                        filter_kw = val.strip().lower()
+                except Exception:
+                    filter_kw = ""
+
+            displayed_chunks = []
             for i, ctx in enumerate(context):
-                st_ui.caption(f"**Context Fragment {i+1}:**")
-                st_ui.text(str(ctx))
+                text_content = getattr(ctx, "text", None) or getattr(getattr(ctx, "node", None), "text", None) or str(ctx)
+                if filter_kw and filter_kw not in text_content.lower():
+                    continue
+                score = getattr(ctx, "score", None)
+                displayed_chunks.append((i + 1, text_content, score))
+
+            if not displayed_chunks and filter_kw:
+                st_ui.caption(f"No passages match keyword: '{filter_kw}'")
+            else:
+                for idx, text_content, score in displayed_chunks:
+                    score_badge = f" · `Score: {score:.4f}`" if score is not None else ""
+                    st_ui.caption(f"**Context Fragment {idx}**{score_badge}")
+                    safe_chunk_text = html.escape(str(text_content))
+                    st_ui.markdown(f"""
+<div style="background: #131217; border: 1px solid #2b2b30; border-radius: 6px; padding: 12px; margin-bottom: 8px; font-family: 'Geist Mono', monospace; font-size: 0.74rem; color: #ededed; line-height: 1.5; overflow-x: auto; white-space: pre-wrap;">
+{safe_chunk_text}
+</div>
+""", unsafe_allow_html=True)
         else:
             st_ui.caption("No raw context snippets were used for this response.")
 
