@@ -1,0 +1,27 @@
+name: Sync to Hugging Face Spaces
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Enforce least privilege: workflow only requires read access to repository contents
+permissions:
+  contents: read
+
+jobs:
+  sync-to-hub:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Push to Hugging Face Spaces
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git -c http.extraHeader="Authorization: Bearer ${HF_TOKEN}" push --force https://huggingface.co/spaces/Aarya003/Financial-Analyst-Agent main
+
